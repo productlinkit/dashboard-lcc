@@ -157,6 +157,9 @@ export const KPI = {
   awaitingAction: 312, // not yet issued/closed (draft → under-review)
   issuedThisMonth: 1894,
   revenueLak: 78_540_000,
+  submittedToday: 176,
+  feesTodayLak: 2_540_000,
+  needsCorrection: 48, // returned / rejected awaiting rework
 };
 
 /* Applications submitted per day, last 7 days */
@@ -169,6 +172,44 @@ export const WEEKLY_VOLUME = [
   { day: "Tue", applications: 188, issued: 142 },
   { day: "Wed", applications: 176, issued: 129 },
 ];
+
+/* Applications registered per month (this year) */
+export const MONTHLY_VOLUME = [
+  { month: "Jan", applications: 980 },
+  { month: "Feb", applications: 1120 },
+  { month: "Mar", applications: 1340 },
+  { month: "Apr", applications: 1210 },
+  { month: "May", applications: 1580 },
+  { month: "Jun", applications: 1890 },
+  { month: "Jul", applications: 4821 },
+  { month: "Aug", applications: 1460 },
+  { month: "Sep", applications: 1320 },
+  { month: "Oct", applications: 1400 },
+  { month: "Nov", applications: 1275 },
+  { month: "Dec", applications: 1190 },
+];
+
+/* Registrations by province/capital (this year) — keys match the GeoJSON `name`. */
+export const PROVINCE_STATS: Record<string, number> = {
+  "Vientiane Capital": 1840,
+  Savannakhet: 1120,
+  Champasak: 690,
+  "Luang Prabang": 540,
+  Vientiane: 480,
+  Khammouane: 420,
+  Oudomxay: 360,
+  Xaignabouli: 300,
+  Salavan: 310,
+  Xiangkhouang: 280,
+  Bolikhamsai: 260,
+  Houaphan: 230,
+  "Luang Namtha": 210,
+  Bokeo: 180,
+  Phongsaly: 160,
+  Attapeu: 140,
+  Xekong: 110,
+  Xaisomboun: 90,
+};
 
 /* Share of applications by service (this month) */
 export const SERVICE_SHARE: Record<string, number> = {

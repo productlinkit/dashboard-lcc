@@ -25,7 +25,7 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
   return (
     <div
       className="min-h-screen w-full flex items-center justify-center p-4"
-      style={{ background: "linear-gradient(135deg, #344EAD 0%, #1a2d7a 100%)" }}
+      style={{ background: "linear-gradient(135deg, #3752AE 0%, #253a86 100%)" }}
     >
       <div className="w-full max-w-md">
         {/* Brand */}
@@ -49,7 +49,7 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 
           {/* Email */}
           <label className="block text-sm font-medium text-gray-700 mb-1.5">Email</label>
-          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 mb-4 focus-within:border-[#344EAD]">
+          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 mb-4 focus-within:border-[#3752AE]">
             <Mail className="w-4 h-4 text-gray-400 flex-shrink-0" />
             <input
               type="email"
@@ -63,7 +63,7 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 
           {/* Password */}
           <label className="block text-sm font-medium text-gray-700 mb-1.5">Password</label>
-          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 mb-6 focus-within:border-[#344EAD]">
+          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 mb-6 focus-within:border-[#3752AE]">
             <Lock className="w-4 h-4 text-gray-400 flex-shrink-0" />
             <input
               type={showPw ? "text" : "password"}
@@ -85,7 +85,7 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 
           <button
             type="submit"
-            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-[#344EAD] text-white hover:bg-[#2a3f8a] transition-all"
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-[#3752AE] text-white hover:bg-[#2c428b] transition-all"
           >
             <LogIn className="w-4 h-4" /> Sign in
           </button>

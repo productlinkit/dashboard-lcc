@@ -29,6 +29,12 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
+      {/* Header */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+        <h1 className="text-xl font-bold text-gray-800">Applications</h1>
+        <p className="text-sm text-gray-400 mt-0.5">Review and process civil registration submissions.</p>
+      </div>
+
       {/* Toolbar */}
       <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
         <div className="flex flex-col lg:flex-row lg:items-center gap-3">
@@ -47,7 +53,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
             <select
               value={service}
               onChange={(e) => setService(e.target.value)}
-              className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 outline-none focus:border-[#344EAD]"
+              className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
             >
               <option value="all">All services</option>
               {SERVICES.map((s) => (
@@ -69,7 +75,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                 onClick={() => setStatus(f.id)}
                 className={`px-3.5 py-1.5 rounded-full text-sm transition-all ${
                   active
-                    ? "bg-[#344EAD] text-white font-medium"
+                    ? "bg-[#3752AE] text-white font-medium"
                     : "bg-gray-100 text-gray-600 hover:bg-gray-200"
                 }`}
               >
@@ -130,7 +136,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                           e.stopPropagation();
                           onOpenCase(a.id);
                         }}
-                        className="inline-flex items-center gap-1.5 text-[#344EAD] hover:underline text-sm"
+                        className="inline-flex items-center gap-1.5 text-[#3752AE] hover:underline text-sm"
                       >
                         <Eye className="w-4 h-4" /> View
                       </button>

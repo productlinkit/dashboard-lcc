@@ -23,7 +23,7 @@ export interface ServiceDef {
 }
 
 export const SERVICES: ServiceDef[] = [
-  { id: "resident", label: "Residence Certificate", laLabel: "ໃບຢັ້ງຢືນທີ່ຢູ່", short: "Residence", icon: Home, color: "#344EAD", fee: 20000 },
+  { id: "resident", label: "Residence Certificate", laLabel: "ໃບຢັ້ງຢືນທີ່ຢູ່", short: "Residence", icon: Home, color: "#3752AE", fee: 20000 },
   { id: "birth", label: "Birth Declaration", laLabel: "ການແຈ້ງເກີດ", short: "Birth", icon: Baby, color: "#0EA5E9", fee: 0 },
   { id: "death", label: "Death Declaration", laLabel: "ການແຈ້ງເສຍຊີວິດ", short: "Death", icon: Cross, color: "#64748B", fee: 0 },
   { id: "marriage", label: "Marriage Certificate", laLabel: "ໃບຢັ້ງຢືນການແຕ່ງງານ", short: "Marriage", icon: Heart, color: "#EC4899", fee: 50000 },

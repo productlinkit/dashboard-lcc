@@ -146,7 +146,7 @@ export function SignaturePad({
                 key={t.id}
                 onClick={() => setTab(t.id)}
                 className={`flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                  active ? "bg-white text-[#344EAD] shadow-sm" : "text-gray-500 hover:text-gray-700"
+                  active ? "bg-white text-[#3752AE] shadow-sm" : "text-gray-500 hover:text-gray-700"
                 }`}
               >
                 <Icon className="w-4 h-4" />
@@ -186,7 +186,7 @@ export function SignaturePad({
                 value={typed}
                 onChange={(e) => setTyped(e.target.value)}
                 placeholder="Type your name"
-                className="w-full px-3 py-2 rounded-xl border border-gray-200 bg-white outline-none text-sm focus:border-[#344EAD]"
+                className="w-full px-3 py-2 rounded-xl border border-gray-200 bg-white outline-none text-sm focus:border-[#3752AE]"
               />
               <div className="mt-3 h-[120px] rounded-xl border border-gray-200 bg-white flex items-center justify-center">
                 {typed.trim() ? (
@@ -202,7 +202,7 @@ export function SignaturePad({
 
           {tab === "image" && (
             <div>
-              <label className="flex flex-col items-center justify-center h-[170px] rounded-xl border-2 border-dashed border-gray-200 bg-gray-50 cursor-pointer hover:border-[#344EAD]/50">
+              <label className="flex flex-col items-center justify-center h-[170px] rounded-xl border-2 border-dashed border-gray-200 bg-gray-50 cursor-pointer hover:border-[#3752AE]/50">
                 {image ? (
                   <img src={image} alt="signature" className="max-h-[150px] object-contain" />
                 ) : (
@@ -227,7 +227,7 @@ export function SignaturePad({
           <button
             onClick={apply}
             disabled={!canApply}
-            className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[#344EAD] text-white hover:bg-[#2a3f8a] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Apply signature
           </button>
