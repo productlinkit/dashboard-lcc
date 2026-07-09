@@ -4,6 +4,7 @@ import { DashboardLayout } from "./components/DashboardLayout";
 import { OverviewPage } from "./pages/OverviewPage";
 import { ApplicationsPage } from "./pages/ApplicationsPage";
 import { CaseDetailPage } from "./pages/CaseDetailPage";
+import { ReportsPage } from "./pages/ReportsPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { LoginPage } from "./pages/LoginPage";
 
@@ -55,12 +56,7 @@ export default function App() {
                 description="Search the civil registry, view citizen profiles, and link records across services. Coming next."
               />
             )}
-            {activeTab === "reports" && (
-              <PlaceholderPage
-                title="Reports"
-                description="Generate registration statistics, revenue summaries, and exportable reports by province and period."
-              />
-            )}
+            {activeTab === "reports" && <ReportsPage />}
             {activeTab === "settings" && (
               <PlaceholderPage
                 title="Settings"

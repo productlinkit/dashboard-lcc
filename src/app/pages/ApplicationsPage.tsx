@@ -1,38 +1,78 @@
-import { useState } from "react";
-import { Search, Filter, Eye } from "lucide-react";
-import {
-  APPLICATIONS,
-  STATUS_ORDER,
-  STATUS_META,
-  type AppStatus,
-} from "../data/mockData";
+import { useEffect, useMemo, useState } from "react";
+import { Search, Eye, Download, ChevronLeft, ChevronRight } from "lucide-react";
+import { APPLICATIONS, STATUS_ORDER, STATUS_META } from "../data/mockData";
 import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
 import { StatusBadge } from "../components/StatusBadge";
+import { MultiSelectFilter } from "../components/MultiSelectFilter";
+import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 
-const STATUS_FILTERS: { id: AppStatus | "all"; label: string }[] = [
-  { id: "all", label: "All" },
-  ...STATUS_ORDER.map((s) => ({ id: s, label: STATUS_META[s].label })),
-];
+const SERVICE_OPTIONS = SERVICES.map((s) => ({ value: s.id, label: s.label, color: s.color }));
+const STATUS_OPTIONS = STATUS_ORDER.map((s) => ({ value: s, label: STATUS_META[s].label, color: STATUS_META[s].color }));
+
+function exportCsv(rows: typeof APPLICATIONS) {
+  const header = ["Ref No", "Applicant", "Service", "Province", "Submitted", "Officer", "Status"];
+  const body = rows.map((a) => [
+    a.id,
+    a.applicant,
+    SERVICE_BY_ID[a.serviceId]?.label ?? a.serviceId,
+    a.province,
+    a.submitted,
+    a.officer ?? "",
+    STATUS_META[a.status].label,
+  ]);
+  const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
+  const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `applications-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => void }) {
-  const [status, setStatus] = useState<AppStatus | "all">("all");
-  const [service, setService] = useState<string>("all");
+  const [services, setServices] = useState<string[]>([]);
+  const [statuses, setStatuses] = useState<string[]>([]);
+  const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const [query, setQuery] = useState("");
 
-  const q = query.trim().toLowerCase();
-  const rows = APPLICATIONS.filter((a) => {
-    if (status !== "all" && a.status !== status) return false;
-    if (service !== "all" && a.serviceId !== service) return false;
-    if (q && !`${a.id} ${a.applicant} ${a.province}`.toLowerCase().includes(q)) return false;
-    return true;
-  });
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+
+  const rows = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return APPLICATIONS.filter((a) => {
+      if (statuses.length && !statuses.includes(a.status)) return false;
+      if (services.length && !services.includes(a.serviceId)) return false;
+      if (!inRange(a.submitted, dateRange)) return false;
+      if (q && !`${a.id} ${a.applicant} ${a.province}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [services, statuses, dateRange, query]);
+
+  // Reset to first page whenever the result set or page size changes.
+  useEffect(() => setPage(1), [services, statuses, dateRange, query, pageSize]);
+
+  const totalRows = rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const start = (currentPage - 1) * pageSize;
+  const pageRows = rows.slice(start, start + pageSize);
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
       {/* Header */}
-      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
-        <h1 className="text-xl font-bold text-gray-800">Applications</h1>
-        <p className="text-sm text-gray-400 mt-0.5">Review and process civil registration submissions.</p>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold text-gray-800">Applications</h1>
+          <p className="text-sm text-gray-400 mt-0.5">Review and process civil registration submissions.</p>
+        </div>
+        <button
+          onClick={() => exportCsv(rows)}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto"
+        >
+          <Download className="w-4 h-4" /> Export
+        </button>
       </div>
 
       {/* Toolbar */}
@@ -48,41 +88,11 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
             />
           </div>
 
-          <div className="flex items-center gap-2">
-            <Filter className="w-4 h-4 text-gray-400" />
-            <select
-              value={service}
-              onChange={(e) => setService(e.target.value)}
-              className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
-            >
-              <option value="all">All services</option>
-              {SERVICES.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.label}
-                </option>
-              ))}
-            </select>
+          <div className="flex flex-wrap items-center gap-2">
+            <MultiSelectFilter label="Services" options={SERVICE_OPTIONS} selected={services} onChange={setServices} />
+            <MultiSelectFilter label="Status" options={STATUS_OPTIONS} selected={statuses} onChange={setStatuses} />
+            <DateRangeFilter onChange={setDateRange} />
           </div>
-        </div>
-
-        {/* Status tabs */}
-        <div className="flex flex-wrap items-center gap-2 mt-3">
-          {STATUS_FILTERS.map((f) => {
-            const active = status === f.id;
-            return (
-              <button
-                key={f.id}
-                onClick={() => setStatus(f.id)}
-                className={`px-3.5 py-1.5 rounded-full text-sm transition-all ${
-                  active
-                    ? "bg-[#3752AE] text-white font-medium"
-                    : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                }`}
-              >
-                {f.label}
-              </button>
-            );
-          })}
         </div>
       </div>
 
@@ -90,8 +100,22 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h2 className="text-base font-semibold text-gray-800">
-            {rows.length} application{rows.length !== 1 ? "s" : ""}
+            {totalRows} application{totalRows !== 1 ? "s" : ""}
           </h2>
+          <div className="flex items-center gap-2 text-sm text-gray-500">
+            <span className="hidden sm:inline">Rows</span>
+            <select
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              className="bg-gray-50 border border-gray-200 rounded-lg pl-2.5 pr-7 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
+            >
+              {[10, 25, 50, 100].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -108,7 +132,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
               </tr>
             </thead>
             <tbody>
-              {rows.map((a) => {
+              {pageRows.map((a) => {
                 const svc = SERVICE_BY_ID[a.serviceId];
                 return (
                   <tr
@@ -144,7 +168,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                   </tr>
                 );
               })}
-              {rows.length === 0 && (
+              {totalRows === 0 && (
                 <tr>
                   <td colSpan={8} className="px-5 py-12 text-center text-sm text-gray-400">
                     No applications match your filters.
@@ -154,6 +178,36 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
             </tbody>
           </table>
         </div>
+
+        {/* Pagination */}
+        {totalRows > 0 && (
+          <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-gray-100">
+            <p className="text-sm text-gray-500">
+              Showing <span className="font-medium text-gray-700">{start + 1}</span>–
+              <span className="font-medium text-gray-700">{Math.min(start + pageSize, totalRows)}</span> of{" "}
+              <span className="font-medium text-gray-700">{totalRows}</span>
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPage(currentPage - 1)}
+                disabled={currentPage <= 1}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <ChevronLeft className="w-4 h-4" /> Prev
+              </button>
+              <span className="text-sm text-gray-500">
+                Page {currentPage} of {totalPages}
+              </span>
+              <button
+                onClick={() => setPage(currentPage + 1)}
+                disabled={currentPage >= totalPages}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Next <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

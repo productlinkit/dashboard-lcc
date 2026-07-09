@@ -2,7 +2,6 @@ import React, { useState } from "react";
 import {
   LayoutDashboard,
   FileText,
-  Users,
   BarChart3,
   Settings,
   Menu,
@@ -26,7 +25,6 @@ const openCount = APPLICATIONS.filter((a) => OPEN_STATUSES.has(a.status)).length
 export const NAV_ITEMS: NavItem[] = [
   { id: "overview", label: "Dashboard", icon: LayoutDashboard },
   { id: "applications", label: "Applications", icon: FileText, badge: openCount },
-  { id: "citizens", label: "Citizens", icon: Users },
   { id: "reports", label: "Reports", icon: BarChart3 },
   { id: "settings", label: "Settings", icon: Settings },
 ];

@@ -135,7 +135,7 @@ export interface Application {
   officer?: string;
 }
 
-export const APPLICATIONS: Application[] = [
+const SEED_APPLICATIONS: Application[] = [
   { id: "RC-2026-004821", applicant: "Somchai Vongphakdy", serviceId: "resident", province: "Vientiane Capital", submitted: "2026-06-24", status: "submitted" },
   { id: "BD-2026-002310", applicant: "Noy Keomanivong", serviceId: "birth", province: "Savannakhet", submitted: "2026-06-24", status: "under-review", officer: "Khamla P." },
   { id: "MC-2026-001145", applicant: "Bounmy & Dao Sisavath", serviceId: "marriage", province: "Luang Prabang", submitted: "2026-06-23", status: "issued", officer: "Vilai S." },
@@ -150,6 +150,57 @@ export const APPLICATIONS: Application[] = [
   { id: "DD-2026-000861", applicant: "Bualy Khounnavong", serviceId: "death", province: "Phongsali", submitted: "2026-06-20", status: "submitted" },
   { id: "RC-2026-004655", applicant: "Khamsao Rattanavong", serviceId: "resident", province: "Vientiane Capital", submitted: "2026-06-19", status: "revoked", officer: "Somsy T." },
 ];
+
+/* Generate additional deterministic rows so the list is paginated and realistic. */
+const GEN_NAMES = [
+  "Somchai Vongduang", "Bounthavy Detsana", "Khampheng Keomany", "Vilaiphone Soukaloun", "Noy Phommachanh",
+  "Latda Sayavong", "Manivanh Khounnavong", "Souksavanh Rattanavong", "Phout Inthavong", "Khamla Sisavath",
+  "Dao Chanthavong", "Bounmy Vilaysack", "Thongdy Phimmasone", "Sengphet Douangchak", "Malaythong Xayasane",
+  "Chanthala Norasing", "Viengkham Boutnaseng", "Somphone Keovilay", "Oudom Panyanouvong", "Keo Souvannaphouma",
+];
+const GEN_PROVINCES = [
+  "Vientiane Capital", "Savannakhet", "Champasak", "Luang Prabang", "Vientiane", "Khammouane", "Oudomxay",
+  "Xaignabouli", "Salavan", "Xiangkhouang", "Bolikhamsai", "Houaphan", "Luang Namtha", "Bokeo", "Phongsaly",
+  "Attapeu", "Xekong", "Xaisomboun",
+];
+const GEN_OFFICERS = ["Khamla P.", "Vilai S.", "Somsy T.", "Bounma K.", "Latda S.", "Noy K."];
+const GEN_STATUS_POOL: AppStatus[] = [
+  "issued", "issued", "issued", "under-review", "submitted", "certified", "registered", "returned", "rejected", "draft", "revoked",
+];
+const SVC_IDS = ["resident", "birth", "death", "marriage", "divorce", "family-book"];
+const SVC_PREFIX: Record<string, string> = {
+  resident: "RC", birth: "BD", death: "DD", marriage: "MC", divorce: "DV", "family-book": "FB",
+};
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function generateApplications(count: number): Application[] {
+  const out: Application[] = [];
+  const base = new Date(2026, 5, 30); // 30 Jun 2026
+  for (let i = 0; i < count; i++) {
+    const svc = SVC_IDS[i % SVC_IDS.length];
+    const id = `${SVC_PREFIX[svc]}-2026-${String(3100 + i).padStart(6, "0")}`;
+    const status = GEN_STATUS_POOL[(i * 11) % GEN_STATUS_POOL.length];
+    const d = new Date(base);
+    d.setDate(d.getDate() - ((i * 3) % 62));
+    const submitted = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const hasOfficer = !(status === "draft" || status === "submitted");
+    out.push({
+      id,
+      applicant: GEN_NAMES[(i * 7) % GEN_NAMES.length],
+      serviceId: svc,
+      province: GEN_PROVINCES[(i * 5) % GEN_PROVINCES.length],
+      submitted,
+      status,
+      officer: hasOfficer ? GEN_OFFICERS[(i * 3) % GEN_OFFICERS.length] : undefined,
+    });
+  }
+  return out;
+}
+
+export const APPLICATIONS: Application[] = [...SEED_APPLICATIONS, ...generateApplications(60)];
 
 /* KPI tiles on the overview page */
 export const KPI = {
