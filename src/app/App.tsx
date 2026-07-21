@@ -7,6 +7,7 @@ import { CaseDetailPage } from "./pages/CaseDetailPage";
 import { ApprovalQueuePage } from "./pages/ApprovalQueuePage";
 import { CivilRegistrationPage } from "./pages/CivilRegistrationPage";
 import { PopulationPage } from "./pages/PopulationPage";
+import { WatchlistPage } from "./pages/WatchlistPage";
 import { PaymentsPage } from "./pages/PaymentsPage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -59,6 +60,7 @@ export default function App() {
             {activeTab === "approval-queue" && <ApprovalQueuePage onOpenCase={setCaseId} />}
             {activeTab === "civil-registration" && <CivilRegistrationPage onOpenCase={setCaseId} />}
             {activeTab === "population" && <PopulationPage />}
+            {activeTab === "watchlist" && <WatchlistPage />}
             {activeTab === "payments" && <PaymentsPage />}
             {activeTab === "reports" && <ReportsPage />}
             {activeTab === "gis-map" && <GisMapPage />}
