@@ -128,7 +128,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                 <th className="px-5 py-3 font-medium">Submitted</th>
                 <th className="px-5 py-3 font-medium">Officer</th>
                 <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 font-medium text-right">Action</th>
+                <th className="pl-4 pr-5 py-3 font-medium w-px whitespace-nowrap">Action</th>
               </tr>
             </thead>
             <tbody>
@@ -154,15 +154,12 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                     <td className="px-5 py-3">
                       <StatusBadge status={a.status} />
                     </td>
-                    <td className="px-5 py-3 text-right">
+                    <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onOpenCase(a.id);
-                        }}
-                        className="inline-flex items-center gap-1.5 text-[#3752AE] hover:underline text-sm"
+                        onClick={() => onOpenCase(a.id)}
+                        className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[96px]"
                       >
-                        <Eye className="w-4 h-4" /> View
+                        <Eye className="w-3.5 h-3.5" /> View
                       </button>
                     </td>
                   </tr>

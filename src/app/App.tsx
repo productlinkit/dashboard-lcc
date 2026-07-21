@@ -4,8 +4,14 @@ import { DashboardLayout } from "./components/DashboardLayout";
 import { OverviewPage } from "./pages/OverviewPage";
 import { ApplicationsPage } from "./pages/ApplicationsPage";
 import { CaseDetailPage } from "./pages/CaseDetailPage";
+import { ApprovalQueuePage } from "./pages/ApprovalQueuePage";
+import { CivilRegistrationPage } from "./pages/CivilRegistrationPage";
+import { PopulationPage } from "./pages/PopulationPage";
+import { PaymentsPage } from "./pages/PaymentsPage";
+import { AlertsPage } from "./pages/AlertsPage";
+import { SettingsPage } from "./pages/SettingsPage";
 import { ReportsPage } from "./pages/ReportsPage";
-import { PlaceholderPage } from "./pages/PlaceholderPage";
+import { GisMapPage } from "./pages/GisMapPage";
 import { LoginPage } from "./pages/LoginPage";
 
 const AUTH_KEY = "lcc-authed";
@@ -50,19 +56,14 @@ export default function App() {
           <>
             {activeTab === "overview" && <OverviewPage onOpenCase={setCaseId} />}
             {activeTab === "applications" && <ApplicationsPage onOpenCase={setCaseId} />}
-            {activeTab === "citizens" && (
-              <PlaceholderPage
-                title="Citizens"
-                description="Search the civil registry, view citizen profiles, and link records across services. Coming next."
-              />
-            )}
+            {activeTab === "approval-queue" && <ApprovalQueuePage onOpenCase={setCaseId} />}
+            {activeTab === "civil-registration" && <CivilRegistrationPage onOpenCase={setCaseId} />}
+            {activeTab === "population" && <PopulationPage />}
+            {activeTab === "payments" && <PaymentsPage />}
             {activeTab === "reports" && <ReportsPage />}
-            {activeTab === "settings" && (
-              <PlaceholderPage
-                title="Settings"
-                description="Manage staff accounts, roles, offices, fees, and service configuration."
-              />
-            )}
+            {activeTab === "gis-map" && <GisMapPage />}
+            {activeTab === "alerts" && <AlertsPage onOpenCase={setCaseId} />}
+            {activeTab === "settings" && <SettingsPage />}
           </>
         )}
       </DashboardLayout>

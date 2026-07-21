@@ -15,6 +15,8 @@ import {
   ResponsiveContainer,
   BarChart,
   Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -37,15 +39,95 @@ import {
   ActivityFeed,
 } from "../components/OverviewWidgets";
 
-/* Registration status breakdown for the pie chart. */
+/* Registration status breakdown — palette validated for CVD separation. */
+const REG_COLORS: Record<string, { color: string; text: string }> = {
+  Approved: { color: "#3752AE", text: "#ffffff" },
+  Pending: { color: "#F59E0B", text: "#0F172A" },
+  Revision: { color: "#0EA5E9", text: "#0F172A" },
+  Failed: { color: "#EF4444", text: "#ffffff" },
+};
+
 const REG_STATS = [
-  { name: "Approved", value: 71, color: "#3752AE" },
-  { name: "Pending", value: 23, color: "#EF4444" },
-  { name: "Revision", value: 1, color: "#F59E0B" },
-  { name: "Failed", value: 5, color: "#B91C1C" },
+  { name: "Approved", value: 71, color: REG_COLORS.Approved.color },
+  { name: "Pending", value: 23, color: REG_COLORS.Pending.color },
+  { name: "Revision", value: 1, color: REG_COLORS.Revision.color },
+  { name: "Failed", value: 5, color: REG_COLORS.Failed.color },
 ];
 
 const YEAR = 2026;
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const RECEIVED_COLOR = "#3752AE";
+const COMPLETED_COLOR = "#10B981";
+
+export interface TrendPoint {
+  label: string;
+  received: number;
+  completed: number;
+}
+
+/* Application trend — bucket size follows the selected range:
+ * ≤31 days → daily, ≤120 days → weekly, otherwise monthly. */
+function buildTrend(
+  range: DateRange,
+  total: number,
+  seed: number,
+): { points: TrendPoint[]; granularity: "day" | "week" | "month" } {
+  const allTime = !range.from && !range.to;
+  if (allTime) {
+    const points = MONTHLY_VOLUME.map((mo, i) => {
+      const sd = (seed * (i + 3)) >>> 0;
+      return {
+        label: mo.month,
+        received: mo.applications,
+        completed: Math.round(mo.applications * (0.58 + (sd % 18) / 100)),
+      };
+    });
+    return { points, granularity: "month" };
+  }
+
+  const from = range.from ? new Date(range.from) : new Date(YEAR, 0, 1);
+  const to = range.to ? new Date(range.to) : new Date();
+  const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000) + 1);
+
+  let granularity: "day" | "week" | "month";
+  let buckets: { label: string; weight: number }[];
+
+  if (days <= 31) {
+    granularity = "day";
+    buckets = Array.from({ length: days }, (_, i) => {
+      const d = new Date(from);
+      d.setDate(d.getDate() + i);
+      return { label: `${d.getMonth() + 1}/${d.getDate()}`, weight: 1 };
+    });
+  } else if (days <= 120) {
+    granularity = "week";
+    const n = Math.ceil(days / 7);
+    buckets = Array.from({ length: n }, (_, i) => {
+      const d = new Date(from);
+      d.setDate(d.getDate() + i * 7);
+      return { label: `${d.getMonth() + 1}/${d.getDate()}`, weight: Math.min(7, days - i * 7) };
+    });
+  } else {
+    granularity = "month";
+    buckets = [];
+    const cur = new Date(from.getFullYear(), from.getMonth(), 1);
+    while (cur <= to && buckets.length < 12) {
+      buckets.push({ label: `${MONTH_ABBR[cur.getMonth()]} '${String(cur.getFullYear()).slice(2)}`, weight: 30 });
+      cur.setMonth(cur.getMonth() + 1);
+    }
+  }
+
+  const wSum = buckets.reduce((a, b) => a + b.weight, 0) || 1;
+  const points = buckets.map((b, i) => {
+    const sd = (seed * (i + 7)) >>> 0;
+    const jitter = 0.75 + (sd % 50) / 100;
+    const received = Math.max(3, Math.round(((total * b.weight) / wSum) * jitter));
+    return { label: b.label, received, completed: Math.round(received * (0.55 + (sd % 20) / 100)) };
+  });
+
+  return { points, granularity };
+}
+
 function hashStr(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -54,10 +136,6 @@ function hashStr(s: string): number {
   }
   return h >>> 0;
 }
-function daysInMonth(m: number): number {
-  return new Date(YEAR, m + 1, 0).getDate();
-}
-
 interface Metrics {
   total: number;
   awaiting: number;
@@ -65,7 +143,6 @@ interface Metrics {
   submitted: number;
   feesLak: number;
   needs: number;
-  monthly: { month: string; applications: number }[];
   reg: { name: string; value: number; color: string }[];
   deltas: { total: string; awaiting: string; issued: string };
   sub: string;
@@ -83,7 +160,6 @@ function metricsFor(range: DateRange): Metrics {
       submitted: KPI.submittedToday,
       feesLak: KPI.feesTodayLak,
       needs: KPI.needsCorrection,
-      monthly: MONTHLY_VOLUME,
       reg: REG_STATS,
       deltas: { total: "+8.2%", awaiting: "+3.1%", issued: "+12.5%" },
       sub: "all time",
@@ -96,13 +172,6 @@ function metricsFor(range: DateRange): Metrics {
   const DAY = 86400000;
   const days = Math.max(1, Math.round((to - from) / DAY) + 1);
   const seed = hashStr(`${range.from}|${range.to}`);
-
-  // Range-length factor (never below a floor) so bars stay populated for short ranges.
-  const factor = Math.min(1, Math.max(0.3, days / 365)) * (0.85 + (seed % 25) / 100);
-  const monthly = MONTHLY_VOLUME.map((mo, i) => {
-    const jitter = 0.8 + ((seed >> i % 11) % 40) / 100; // 0.80–1.19
-    return { month: mo.month, applications: Math.max(150, Math.round(mo.applications * factor * jitter)) };
-  });
 
   const rate = 55 + (seed % 25); // applications per day
   const total = Math.max(240, Math.round(rate * days));
@@ -119,12 +188,11 @@ function metricsFor(range: DateRange): Metrics {
     submitted: Math.max(8, Math.round(total * 0.11)),
     feesLak: Math.max(200_000, Math.round(total * 8000)),
     needs: Math.max(4, Math.round(total * 0.03)),
-    monthly,
     reg: [
-      { name: "Approved", value: approved, color: "#3752AE" },
-      { name: "Pending", value: pending, color: "#EF4444" },
-      { name: "Revision", value: revision, color: "#F59E0B" },
-      { name: "Failed", value: failed, color: "#B91C1C" },
+      { name: "Approved", value: approved, color: REG_COLORS.Approved.color },
+      { name: "Pending", value: pending, color: REG_COLORS.Pending.color },
+      { name: "Revision", value: revision, color: REG_COLORS.Revision.color },
+      { name: "Failed", value: failed, color: REG_COLORS.Failed.color },
     ],
     deltas: { total: delta(1), awaiting: delta(3), issued: delta(7) },
     sub: "in selected period",
@@ -190,6 +258,8 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const m = useMemo(() => metricsFor(dateRange), [dateRange]);
   const services = useMemo(() => deriveServices(m.total, m.seed), [m.total, m.seed]);
+  const trend = useMemo(() => buildTrend(dateRange, m.total, m.seed), [dateRange, m.total, m.seed]);
+  const useBars = trend.points.length <= 14;
 
   const openCases = APPLICATIONS.filter((a) =>
     ["submitted", "certified", "under-review", "returned"].includes(a.status),
@@ -236,40 +306,100 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Monthly bar chart */}
         <div className="lg:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-800">Monthly registered</h2>
-          <p className="text-sm text-gray-400 mb-4">Total registrations per month</p>
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <h2 className="text-base font-semibold text-gray-800">Application trend</h2>
+              <p className="text-sm text-gray-400">
+                Received vs completed ·{" "}
+                {trend.granularity === "day" ? "daily" : trend.granularity === "week" ? "weekly" : "monthly"}
+              </p>
+            </div>
+            <div className="flex items-center gap-4 text-xs flex-shrink-0">
+              <span className="flex items-center gap-1.5 text-gray-500">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: RECEIVED_COLOR }} /> Received
+              </span>
+              <span className="flex items-center gap-1.5 text-gray-500">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: COMPLETED_COLOR }} /> Completed
+              </span>
+            </div>
+          </div>
           <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={m.monthly} margin={{ left: -12, right: 8, top: 8 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
-              <XAxis dataKey="month" tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
-              <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
-              <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
-              <Bar dataKey="applications" fill="#3752AE" radius={[6, 6, 0, 0]} barSize={22} />
-            </BarChart>
+            {useBars ? (
+              <BarChart data={trend.points} margin={{ left: -12, right: 8, top: 8 }} barGap={2} barCategoryGap="28%">
+                <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
+                <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
+                <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={44} />
+                <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
+                <Bar dataKey="received" name="Received" fill={RECEIVED_COLOR} radius={[4, 4, 0, 0]} />
+                <Bar dataKey="completed" name="Completed" fill={COMPLETED_COLOR} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            ) : (
+              <LineChart data={trend.points} margin={{ left: -12, right: 8, top: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
+                <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} minTickGap={16} />
+                <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={44} />
+                <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
+                <Line type="monotone" dataKey="received" name="Received" stroke={RECEIVED_COLOR} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="completed" name="Completed" stroke={COMPLETED_COLOR} strokeWidth={2} dot={false} />
+              </LineChart>
+            )}
           </ResponsiveContainer>
         </div>
 
-        {/* Pie chart */}
+        {/* Donut chart */}
         <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-800">Registration statistics</h2>
-          <p className="text-sm text-gray-400 mb-2">Status breakdown</p>
-          <ResponsiveContainer width="100%" height={200}>
-            <PieChart>
-              <Pie data={m.reg} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} innerRadius={0}>
-                {m.reg.map((s) => (
-                  <Cell key={s.name} fill={s.color} />
-                ))}
-              </Pie>
-              <Tooltip formatter={(v: number) => `${v}%`} contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
-            </PieChart>
-          </ResponsiveContainer>
-          <div className="grid grid-cols-2 gap-2 mt-3">
-            {m.reg.map((s) => (
-              <span key={s.name} className="flex items-center gap-1.5 text-xs text-gray-500">
-                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: s.color }} />
-                {s.name}: {s.value}%
-              </span>
-            ))}
+          <p className="text-sm text-gray-400">Status breakdown</p>
+
+          <div className="relative mt-2">
+            <ResponsiveContainer width="100%" height={210}>
+              <PieChart>
+                <Pie
+                  data={m.reg}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={64}
+                  outerRadius={92}
+                  paddingAngle={4}
+                  cornerRadius={10}
+                  stroke="none"
+                >
+                  {m.reg.map((s) => (
+                    <Cell key={s.name} fill={s.color} />
+                  ))}
+                </Pie>
+                <Tooltip
+                  formatter={(v: number) => `${v}%`}
+                  contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {/* Centre total */}
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+              <p className="text-xs text-gray-400">Total applications</p>
+              <p className="text-2xl font-bold text-gray-800">{m.total.toLocaleString()}</p>
+            </div>
+          </div>
+
+          {/* Legend rows */}
+          <div className="mt-4 space-y-2">
+            {m.reg.map((s) => {
+              const count = Math.round((m.total * s.value) / 100);
+              return (
+                <div key={s.name} className="flex items-center gap-3">
+                  <span
+                    className="w-12 h-8 rounded-lg flex items-center justify-center text-xs font-bold flex-shrink-0"
+                    style={{ backgroundColor: s.color, color: REG_COLORS[s.name]?.text ?? "#ffffff" }}
+                  >
+                    {s.value}%
+                  </span>
+                  <span className="flex-1 text-sm text-gray-600 truncate">{s.name}</span>
+                  <span className="text-sm font-semibold text-gray-800 tabular-nums">{count.toLocaleString()}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>

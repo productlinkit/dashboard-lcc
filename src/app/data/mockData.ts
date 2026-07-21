@@ -163,10 +163,25 @@ const GEN_PROVINCES = [
   "Xaignabouli", "Salavan", "Xiangkhouang", "Bolikhamsai", "Houaphan", "Luang Namtha", "Bokeo", "Phongsaly",
   "Attapeu", "Xekong", "Xaisomboun",
 ];
-const GEN_OFFICERS = ["Khamla P.", "Vilai S.", "Somsy T.", "Bounma K.", "Latda S.", "Noy K."];
-const GEN_STATUS_POOL: AppStatus[] = [
-  "issued", "issued", "issued", "under-review", "submitted", "certified", "registered", "returned", "rejected", "draft", "revoked",
+/* Recombined with the given names above so 260 rows don't repeat every 20. */
+const GEN_SURNAMES = [
+  "Vongsa", "Sisoulath", "Phanthavong", "Keomanivong", "Sengdara", "Inthasone", "Bounyavong",
+  "Chanthaphone", "Xaiyavong", "Souphanousinh", "Namvong", "Rasphone", "Thammavong",
 ];
+const GEN_OFFICERS = ["Khamla P.", "Vilai S.", "Somsy T.", "Bounma K.", "Latda S.", "Noy K."];
+/* 20 slots — the mix roughly matches a real office: most cases end up issued,
+ * but ~40% sit in the three stages that wait on an officer (approval queue). */
+const GEN_STATUS_POOL: AppStatus[] = [
+  "issued", "issued", "issued", "issued", "issued",
+  "registered", "registered",
+  "under-review", "under-review", "under-review",
+  "submitted", "submitted", "submitted",
+  "certified", "certified",
+  "returned", "returned",
+  "draft", "rejected", "revoked",
+];
+/* Statuses still waiting on an officer — kept recent so SLA ageing is realistic. */
+const PENDING_STATUSES = new Set<AppStatus>(["draft", "submitted", "certified", "under-review", "returned"]);
 const SVC_IDS = ["resident", "birth", "death", "marriage", "divorce", "family-book"];
 const SVC_PREFIX: Record<string, string> = {
   resident: "RC", birth: "BD", death: "DD", marriage: "MC", divorce: "DV", "family-book": "FB",
@@ -178,18 +193,22 @@ function pad2(n: number): string {
 
 function generateApplications(count: number): Application[] {
   const out: Application[] = [];
-  const base = new Date(2026, 5, 30); // 30 Jun 2026
+  const base = new Date(); // rolling window ending today, so dates are never in the future
   for (let i = 0; i < count; i++) {
     const svc = SVC_IDS[i % SVC_IDS.length];
     const id = `${SVC_PREFIX[svc]}-2026-${String(3100 + i).padStart(6, "0")}`;
-    const status = GEN_STATUS_POOL[(i * 11) % GEN_STATUS_POOL.length];
+    // Stride 7 is coprime with the 20-slot pool, so every status is used.
+    const status = GEN_STATUS_POOL[(i * 7) % GEN_STATUS_POOL.length];
     const d = new Date(base);
-    d.setDate(d.getDate() - ((i * 3) % 62));
+    // Open cases are days old; closed ones spread across the last ~4 months.
+    d.setDate(d.getDate() - (PENDING_STATUSES.has(status) ? (i * 13) % 12 : ((i * 13) % 118) + 2));
     const submitted = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     const hasOfficer = !(status === "draft" || status === "submitted");
     out.push({
       id,
-      applicant: GEN_NAMES[(i * 7) % GEN_NAMES.length],
+      applicant: `${GEN_NAMES[(i * 7) % GEN_NAMES.length].split(" ")[0]} ${
+        GEN_SURNAMES[(i * 5) % GEN_SURNAMES.length]
+      }`,
       serviceId: svc,
       province: GEN_PROVINCES[(i * 5) % GEN_PROVINCES.length],
       submitted,
@@ -200,7 +219,7 @@ function generateApplications(count: number): Application[] {
   return out;
 }
 
-export const APPLICATIONS: Application[] = [...SEED_APPLICATIONS, ...generateApplications(60)];
+export const APPLICATIONS: Application[] = [...SEED_APPLICATIONS, ...generateApplications(260)];
 
 /* KPI tiles on the overview page */
 export const KPI = {
@@ -224,21 +243,29 @@ export const WEEKLY_VOLUME = [
   { day: "Wed", applications: 176, issued: 129 },
 ];
 
-/* Applications registered per month (this year) */
-export const MONTHLY_VOLUME = [
-  { month: "Jan", applications: 980 },
-  { month: "Feb", applications: 1120 },
-  { month: "Mar", applications: 1340 },
-  { month: "Apr", applications: 1210 },
-  { month: "May", applications: 1580 },
-  { month: "Jun", applications: 1890 },
-  { month: "Jul", applications: 4821 },
-  { month: "Aug", applications: 1460 },
-  { month: "Sep", applications: 1320 },
-  { month: "Oct", applications: 1400 },
-  { month: "Nov", applications: 1275 },
-  { month: "Dec", applications: 1190 },
-];
+/* Applications registered per month — rolling last 12 months ending this month.
+ * Avoids showing future months; the current (partial) month is pro-rated. */
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function buildMonthlyVolume(): { month: string; applications: number }[] {
+  const now = new Date();
+  const out: { month: string; applications: number }[] = [];
+  for (let back = 11; back >= 0; back--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - back, 1);
+    const idx = 11 - back; // 0 = oldest … 11 = current
+    const jitter = 0.85 + ((idx * 37) % 30) / 100;
+    let value = Math.round((900 + idx * 95) * jitter);
+    if (back === 0) {
+      // Current month is still in progress — pro-rate by days elapsed.
+      const daysInMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      value = Math.max(120, Math.round(value * (now.getDate() / daysInMonth)));
+    }
+    out.push({ month: `${MONTH_NAMES[d.getMonth()]} '${String(d.getFullYear()).slice(2)}`, applications: value });
+  }
+  return out;
+}
+
+export const MONTHLY_VOLUME = buildMonthlyVolume();
 
 /* Registrations by province/capital (this year) — keys match the GeoJSON `name`. */
 export const PROVINCE_STATS: Record<string, number> = {

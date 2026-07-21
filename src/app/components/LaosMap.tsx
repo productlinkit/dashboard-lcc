@@ -48,7 +48,9 @@ function styleFor(name: string, focus: string | null): PathOptions {
   };
 }
 
-export function LaosMap() {
+/* `fill` makes the map stretch to its container instead of the fixed 380px card
+ * height — used by the dedicated GIS Map page. */
+export function LaosMap({ fill = false, zoom = DEFAULT_ZOOM }: { fill?: boolean; zoom?: number } = {}) {
   const [geo, setGeo] = useState<FeatureCollection | null>(null);
   const [active, setActive] = useState<string | null>(null);
   const [listHover, setListHover] = useState<string | null>(null);
@@ -98,7 +100,7 @@ export function LaosMap() {
 
   function clearFilter() {
     setActive(null);
-    mapRef.current?.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+    mapRef.current?.setView(DEFAULT_CENTER, zoom);
   }
 
   function selectProvince(name: string) {
@@ -113,20 +115,23 @@ export function LaosMap() {
 
   if (error) {
     return (
-      <div className="h-[380px] flex items-center justify-center text-sm text-gray-400">
+      <div className={`${fill ? "h-full" : "h-[380px]"} flex items-center justify-center text-sm text-gray-400`}>
         Could not load the map data.
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col lg:flex-row gap-4">
+    <div className={`flex flex-col lg:flex-row gap-4 ${fill ? "h-full min-h-0" : ""}`}>
       {/* Map */}
-      <div className="relative flex-1 rounded-xl overflow-hidden border border-gray-100" style={{ height: 380 }}>
+      <div
+        className={`relative flex-1 rounded-xl overflow-hidden border border-gray-100 ${fill ? "min-h-0" : ""}`}
+        style={fill ? undefined : { height: 380 }}
+      >
         <MapContainer
           ref={mapRef}
-          center={[18.2, 104.3]}
-          zoom={5}
+          center={DEFAULT_CENTER}
+          zoom={zoom}
           scrollWheelZoom={false}
           style={{ height: "100%", width: "100%" }}
         >
@@ -164,7 +169,12 @@ export function LaosMap() {
       </div>
 
       {/* Province list */}
-      <div className="lg:w-60 flex-shrink-0 border border-gray-100 rounded-xl flex flex-col" style={{ height: 380 }}>
+      <div
+        className={`lg:w-60 flex-shrink-0 border border-gray-100 rounded-xl flex flex-col ${
+          fill ? "h-64 lg:h-auto lg:min-h-0" : ""
+        }`}
+        style={fill ? undefined : { height: 380 }}
+      >
         <div className="px-3.5 py-2.5 border-b border-gray-100 flex items-center justify-between">
           {active ? (
             <button

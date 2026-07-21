@@ -2,7 +2,13 @@ import React, { useState } from "react";
 import {
   LayoutDashboard,
   FileText,
+  ClipboardCheck,
+  ScrollText,
+  Users,
+  Banknote,
   BarChart3,
+  Map,
+  Bell,
   Settings,
   Menu,
   X,
@@ -21,12 +27,19 @@ export interface NavItem {
 
 const OPEN_STATUSES = new Set(["draft", "submitted", "certified", "under-review", "returned"]);
 const openCount = APPLICATIONS.filter((a) => OPEN_STATUSES.has(a.status)).length;
+const approvalCount = APPLICATIONS.filter((a) => a.status === "certified" || a.status === "under-review").length;
 
 export const NAV_ITEMS: NavItem[] = [
   { id: "overview", label: "Dashboard", icon: LayoutDashboard },
   { id: "applications", label: "Applications", icon: FileText, badge: openCount },
-  { id: "reports", label: "Reports", icon: BarChart3 },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "approval-queue", label: "Approval Queue", icon: ClipboardCheck, badge: approvalCount },
+  { id: "civil-registration", label: "Civil Registration", icon: ScrollText },
+  { id: "population", label: "Population & Households", icon: Users },
+  { id: "payments", label: "Payments & Revenue", icon: Banknote },
+  { id: "reports", label: "Reports & Analytics", icon: BarChart3 },
+  { id: "gis-map", label: "GIS Map", icon: Map },
+  { id: "alerts", label: "Alerts & Notifications", icon: Bell },
+  { id: "settings", label: "Administration / Settings", icon: Settings },
 ];
 
 export function DashboardLayout({
@@ -65,6 +78,7 @@ export function DashboardLayout({
                 onTabChange(item.id);
                 setMobileOpen(false);
               }}
+              title={item.label}
               className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm transition-all duration-200 ${
                 active
                   ? "text-white font-semibold shadow-md shadow-[#3752AE]/20"
@@ -72,11 +86,11 @@ export function DashboardLayout({
               }`}
               style={active ? { background: "linear-gradient(90deg, #3752AE 0%, #2c428b 100%)" } : undefined}
             >
-              <Icon className="w-[18px] h-[18px]" />
-              {item.label}
+              <Icon className="w-[18px] h-[18px] flex-shrink-0" />
+              <span className="flex-1 text-left truncate">{item.label}</span>
               {item.badge != null && (
                 <span
-                  className={`ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+                  className={`flex-shrink-0 text-[11px] font-semibold px-2 py-0.5 rounded-full ${
                     active ? "bg-white/20 text-white" : "bg-[#3752AE] text-white"
                   }`}
                 >
