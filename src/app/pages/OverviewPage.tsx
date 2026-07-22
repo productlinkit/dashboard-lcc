@@ -6,7 +6,6 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   Download,
-  Plus,
   Wifi,
   Send,
   AlertTriangle,
@@ -289,9 +288,6 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
           <DateRangeFilter onChange={setDateRange} />
           <button className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200">
             <Download className="w-4 h-4" /> Export
-          </button>
-          <button className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]">
-            <Plus className="w-4 h-4" /> New application
           </button>
         </div>
       </div>
