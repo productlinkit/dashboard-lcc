@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { Search, Users, Home, UserCheck, Baby, Eye, ChevronLeft, ChevronRight, Download } from "lucide-react";
+import { Search, Users, Home, UserCheck, Baby, Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download } from "lucide-react";
 import {
   CITIZENS,
   HOUSEHOLDS,
@@ -18,6 +18,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from "../components/ui/dialog";
+import { PersonRecord } from "../components/PersonRecord";
 
 const MALE_COLOR = "#3752AE";
 const FEMALE_COLOR = "#EC4899";
@@ -117,6 +118,7 @@ export function PopulationPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [openHousehold, setOpenHousehold] = useState<Household | null>(null);
+  const [openPerson, setOpenPerson] = useState<Citizen | null>(null);
 
   const citizenRows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -159,6 +161,28 @@ export function PopulationPage() {
       .slice(0, 6);
   }, []);
   const maxProvince = topProvinces[0]?.[1] ?? 1;
+
+  /* Opening a citizen replaces the page, the same way Watchlist Search does —
+   * the record is too big to read comfortably inside a dialog. */
+  if (openPerson) {
+    return (
+      <div className="max-w-screen-2xl mx-auto space-y-4">
+        <button
+          onClick={() => setOpenPerson(null)}
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-[#3752AE] hover:underline"
+        >
+          <ArrowLeft className="w-4 h-4" /> Back to Population &amp; Households
+        </button>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+          <h1 className="text-xl font-bold text-gray-800">{openPerson.name}</h1>
+          <p className="text-sm text-gray-400 mt-0.5">
+            {openPerson.uin} · {openPerson.village}, {openPerson.district}, {openPerson.province}
+          </p>
+        </div>
+        <PersonRecord person={openPerson} />
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -385,12 +409,20 @@ export function PopulationPage() {
                       <StatusChip status={c.status} />
                     </td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap">
-                      <button
-                        onClick={() => setOpenHousehold(HOUSEHOLDS.find((h) => h.no === c.householdNo) ?? null)}
-                        className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[110px]"
-                      >
-                        <Eye className="w-3.5 h-3.5" /> Household
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setOpenPerson(c)}
+                          className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[110px]"
+                        >
+                          <FileText className="w-3.5 h-3.5" /> See doc
+                        </button>
+                        <button
+                          onClick={() => setOpenHousehold(HOUSEHOLDS.find((h) => h.no === c.householdNo) ?? null)}
+                          className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200 w-[110px]"
+                        >
+                          <Eye className="w-3.5 h-3.5" /> Household
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -528,6 +560,7 @@ export function PopulationPage() {
                       <th className="px-4 py-2.5 font-medium">Date of birth</th>
                       <th className="px-4 py-2.5 font-medium">Age</th>
                       <th className="px-4 py-2.5 font-medium">Status</th>
+                      <th className="pl-2 pr-4 py-2.5 font-medium w-px" />
                     </tr>
                   </thead>
                   <tbody>
@@ -545,6 +578,18 @@ export function PopulationPage() {
                         <td className="px-4 py-2.5 text-gray-600">{m.age}</td>
                         <td className="px-4 py-2.5">
                           <StatusChip status={m.status} />
+                        </td>
+                        <td className="pl-2 pr-4 py-2.5 w-px">
+                          <button
+                            onClick={() => {
+                              setOpenHousehold(null);
+                              setOpenPerson(m);
+                            }}
+                            title="See documents"
+                            className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-[#3752AE] hover:bg-[#3752AE]/10"
+                          >
+                            <FileText className="w-4 h-4" />
+                          </button>
                         </td>
                       </tr>
                     ))}

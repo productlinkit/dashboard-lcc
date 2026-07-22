@@ -1,50 +1,13 @@
-import { Clock, AlertTriangle, Activity } from "lucide-react";
-import { SERVICES, formatLak } from "../serviceConfig";
-import { PIPELINE_ORDER, STATUS_META } from "../data/mockData";
+import { AlertTriangle, Activity } from "lucide-react";
+import { formatLak } from "../serviceConfig";
+import { STATUS_ORDER, STATUS_META, type AppStatus } from "../data/mockData";
 
-/* ── Per-service derivation (reacts to total + seed from the date filter) ── */
-const SERVICE_WEIGHT: Record<string, number> = {
-  resident: 0.38,
-  birth: 0.23,
-  death: 0.11,
-  marriage: 0.14,
-  divorce: 0.04,
-  "family-book": 0.1,
-};
+/* Per-service figures come from the shared stats module, so By service and the
+ * SLA tracker show exactly what Reports shows. */
+export type { ServiceStat as ServiceRow } from "../data/serviceStats";
+import type { ServiceStat as ServiceRow } from "../data/serviceStats";
 
-export interface ServiceRow {
-  id: string;
-  short: string;
-  color: string;
-  icon: (typeof SERVICES)[number]["icon"];
-  volume: number;
-  issued: number;
-  progress: number;
-  rejected: number;
-  sla: number;
-  feesLak: number;
-}
-
-export function deriveServices(total: number, seed: number): ServiceRow[] {
-  return SERVICES.map((s, i) => {
-    const sd = (seed * (i + 3)) >>> 0;
-    const volume = Math.max(20, Math.round(total * (SERVICE_WEIGHT[s.id] ?? 0.1)));
-    const issued = 60 + (sd % 12);
-    const rejected = 3 + (sd % 5);
-    return {
-      id: s.id,
-      short: s.short,
-      color: s.color,
-      icon: s.icon,
-      volume,
-      issued,
-      progress: 100 - issued - rejected,
-      rejected,
-      sla: 82 + (sd % 16),
-      feesLak: volume * s.fee,
-    };
-  });
-}
+const pct = (n: number, total: number) => (total > 0 ? (n / total) * 100 : 0);
 
 /* ── 1. Per-service panel ── */
 export function PerServicePanel({ services }: { services: ServiceRow[] }) {
@@ -68,17 +31,30 @@ export function PerServicePanel({ services }: { services: ServiceRow[] }) {
               </span>
               <div className="w-24 flex-shrink-0 hidden sm:block text-sm text-gray-700 truncate">{s.short}</div>
               <div className="flex-1 min-w-0">
-                <div className="flex items-center justify-between text-xs mb-1">
-                  <span className="text-gray-500">{s.volume.toLocaleString()} apps</span>
-                  <span className="text-gray-400">SLA {s.sla}%</span>
+                <div className="flex items-center justify-between gap-3 text-xs mb-1">
+                  <span className="text-gray-500 flex-shrink-0">{s.volume.toLocaleString()} apps</span>
+                  <span className="flex items-center gap-2.5 text-gray-600 tabular-nums">
+                    <span className="flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                      {s.issued.toLocaleString()}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#3752AE]" />
+                      {s.inProgress.toLocaleString()}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                      {s.rejected.toLocaleString()}
+                    </span>
+                  </span>
                 </div>
                 <div className="h-2 rounded-full overflow-hidden flex bg-gray-100">
-                  <div style={{ width: `${s.issued}%`, backgroundColor: "#10B981" }} />
-                  <div style={{ width: `${s.progress}%`, backgroundColor: "#3752AE" }} />
-                  <div style={{ width: `${s.rejected}%`, backgroundColor: "#EF4444" }} />
+                  <div style={{ width: `${pct(s.issued, s.volume)}%`, backgroundColor: "#10B981" }} />
+                  <div style={{ width: `${pct(s.inProgress, s.volume)}%`, backgroundColor: "#3752AE" }} />
+                  <div style={{ width: `${pct(s.rejected, s.volume)}%`, backgroundColor: "#EF4444" }} />
                 </div>
               </div>
-              <div className="w-24 flex-shrink-0 text-right text-sm font-medium text-gray-700">{formatLak(s.feesLak)}</div>
+              <div className="w-24 flex-shrink-0 text-right text-sm font-medium text-gray-700">{s.collected > 0 ? formatLak(s.collected) : "Free"}</div>
             </div>
           );
         })}
@@ -87,38 +63,69 @@ export function PerServicePanel({ services }: { services: ServiceRow[] }) {
   );
 }
 
-/* ── 2. SLA & overdue tracker ── */
-export function SlaTracker({ services, total, seed }: { services: ServiceRow[]; total: number; seed: number }) {
-  const overdue = Math.max(3, Math.round(total * 0.05));
-  const avgDays = (1.2 + (seed % 20) / 10).toFixed(1);
+/* ── 2. SLA & overdue tracker ──
+ * Bands explain the red/amber/green: a service is On target at 90%+ of cases
+ * closed inside the target, At risk from 85%, and Breaching below that. */
+const SLA_BANDS = [
+  { min: 90, label: "On target", color: "#10B981", text: "text-emerald-600" },
+  { min: 85, label: "At risk", color: "#F59E0B", text: "text-amber-600" },
+  { min: 0, label: "Breaching", color: "#EF4444", text: "text-red-500" },
+];
+function slaBand(pct: number) {
+  return SLA_BANDS.find((b) => pct >= b.min) ?? SLA_BANDS[SLA_BANDS.length - 1];
+}
+
+export function SlaTracker({ services }: { services: ServiceRow[] }) {
+  /* One question only: how many cases missed their target, and where. Every
+   * figure comes from the same per-service percentages shown in the rows, so
+   * the headline and the bars can never disagree. */
+  const rows = services.map((s) => ({ ...s, band: slaBand(s.sla) }));
+  const volume = rows.reduce((sum, s) => sum + s.closed, 0);
+  const overdue = rows.reduce((sum, s) => sum + s.overdue, 0);
+  const share = volume > 0 ? Math.round((overdue / volume) * 100) : 0;
+
   return (
     <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-      <h2 className="text-base font-semibold text-gray-800 mb-4">SLA &amp; overdue</h2>
-      <div className="grid grid-cols-2 gap-3 mb-4">
-        <div className="rounded-xl bg-amber-50 border border-amber-100 p-3">
-          <div className="flex items-center gap-1.5 text-amber-600 text-xs font-medium">
-            <AlertTriangle className="w-3.5 h-3.5" /> Overdue
-          </div>
-          <p className="text-2xl font-bold text-gray-800 mt-1">{overdue.toLocaleString()}</p>
+      <h2 className="text-base font-semibold text-gray-800">SLA &amp; overdue</h2>
+      <p className="text-xs text-gray-400 mb-3">Cases closed past their service target</p>
+
+      <div className="rounded-xl bg-amber-50 border border-amber-100 p-3 mb-3">
+        <div className="flex items-center gap-1.5 text-amber-600 text-xs font-medium">
+          <AlertTriangle className="w-3.5 h-3.5" /> Overdue
         </div>
-        <div className="rounded-xl bg-[#3752AE]/5 border border-[#3752AE]/10 p-3">
-          <div className="flex items-center gap-1.5 text-[#3752AE] text-xs font-medium">
-            <Clock className="w-3.5 h-3.5" /> Avg. time
-          </div>
-          <p className="text-2xl font-bold text-gray-800 mt-1">
-            {avgDays}<span className="text-sm font-medium text-gray-400"> days</span>
-          </p>
-        </div>
+        <p className="text-2xl font-bold text-gray-800 mt-1">
+          {overdue.toLocaleString()}
+          <span className="text-sm font-medium text-gray-400"> cases</span>
+        </p>
+        <p className="text-[11px] text-gray-400">
+          {share}% of {volume.toLocaleString()} closed cases
+        </p>
       </div>
+
+      {/* What the colours mean */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-3 text-[11px] text-gray-500">
+        {SLA_BANDS.map((b, i) => (
+          <span key={b.label} className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: b.color }} />
+            {b.label} {i === 0 ? `≥ ${b.min}%` : i === SLA_BANDS.length - 1 ? `< ${SLA_BANDS[i - 1].min}%` : `${b.min}–${SLA_BANDS[i - 1].min - 1}%`}
+          </span>
+        ))}
+      </div>
+
       <div className="space-y-2.5">
-        {services.map((s) => (
+        {rows.map((s) => (
           <div key={s.id}>
-            <div className="flex items-center justify-between text-xs mb-1">
-              <span className="text-gray-600">{s.short}</span>
-              <span className={s.sla >= 90 ? "text-emerald-600" : s.sla >= 85 ? "text-amber-600" : "text-red-500"}>{s.sla}%</span>
+            <div className="flex items-center justify-between gap-2 text-xs mb-1">
+              <span className="text-gray-600 truncate">{s.short}</span>
+              <span className="flex items-center gap-2 flex-shrink-0 tabular-nums">
+                <span className={s.band.text} title={`${s.band.label} — ${s.sla}% closed within the ${s.target}-day target`}>
+                  {s.sla}%
+                </span>
+                <span className="text-gray-400">{s.overdue.toLocaleString()} overdue</span>
+              </span>
             </div>
             <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-              <div className="h-full rounded-full" style={{ width: `${s.sla}%`, backgroundColor: s.sla >= 90 ? "#10B981" : s.sla >= 85 ? "#F59E0B" : "#EF4444" }} />
+              <div className="h-full rounded-full" style={{ width: `${s.sla}%`, backgroundColor: s.band.color }} />
             </div>
           </div>
         ))}
@@ -127,29 +134,42 @@ export function SlaTracker({ services, total, seed }: { services: ServiceRow[]; 
   );
 }
 
-/* ── 3. Pipeline funnel ── */
-const FUNNEL_FACTOR = [0.3, 0.26, 0.22, 0.18, 0.14, 0.11];
-export function PipelineFunnel({ total, seed }: { total: number; seed: number }) {
-  const stages = PIPELINE_ORDER.map((s, i) => {
-    const sd = (seed * (i + 5)) >>> 0;
-    const jitter = 0.9 + (sd % 20) / 100;
-    return { status: s, count: Math.max(5, Math.round(total * FUNNEL_FACTOR[i] * jitter)) };
-  });
-  const max = Math.max(...stages.map((s) => s.count));
+/* ── 3. Pipeline funnel ──
+ * Every status from the Applications filter, in the same order and counted from
+ * the same rows. Exception states are marked so they don't read as funnel steps. */
+const EXCEPTION_STATUSES = new Set(["returned", "rejected", "revoked"]);
+const SHORT_LABEL: Record<string, string> = {
+  returned: "Returned",
+  registered: "Registered",
+  revoked: "Revoked",
+};
+
+export function PipelineFunnel({ counts }: { counts: Record<AppStatus, number> }) {
+  const stages = STATUS_ORDER.map((s) => ({ status: s, count: counts[s] ?? 0 }));
+  const max = Math.max(1, ...stages.map((s) => s.count));
   return (
     <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm h-full flex flex-col">
       <h2 className="text-base font-semibold text-gray-800">Case pipeline</h2>
-      <p className="text-sm text-gray-400 mb-4">Cases at each lifecycle stage</p>
-      <div className="flex-1 flex flex-col justify-between gap-2.5">
+      <p className="text-sm text-gray-400 mb-3">All nine case statuses · exceptions marked ⤴</p>
+      <div className="flex-1 flex flex-col justify-between gap-1.5">
         {stages.map((s) => {
           const meta = STATUS_META[s.status];
+          const exception = EXCEPTION_STATUSES.has(s.status);
           return (
-            <div key={s.status} className="flex items-center gap-3">
-              <div className="w-28 flex-shrink-0 text-sm text-gray-600 truncate">{meta.label}</div>
-              <div className="flex-1 h-6 rounded-lg bg-gray-50 overflow-hidden">
+            <div key={s.status} className="flex items-center gap-2.5">
+              <span
+                className="w-[104px] flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium"
+                style={{ color: meta.color, backgroundColor: meta.bg }}
+                title={`${meta.label} — ${meta.meaning}`}
+              >
+                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: meta.color }} />
+                <span className="truncate">{SHORT_LABEL[s.status] ?? meta.label}</span>
+                {exception && <span className="flex-shrink-0 opacity-60">⤴</span>}
+              </span>
+              <div className="flex-1 h-5 rounded-lg overflow-hidden" style={{ backgroundColor: meta.bg }}>
                 <div
                   className="h-full rounded-lg flex items-center justify-end px-2 text-[11px] font-medium text-white"
-                  style={{ width: `${Math.max(12, (s.count / max) * 100)}%`, backgroundColor: meta.color }}
+                  style={{ width: `${Math.max(14, (s.count / max) * 100)}%`, backgroundColor: meta.color }}
                 >
                   {s.count.toLocaleString()}
                 </div>

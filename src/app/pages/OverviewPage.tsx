@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Banknote,
   ArrowUpRight,
+  ArrowDownRight,
   Download,
   Plus,
   Wifi,
@@ -26,36 +27,67 @@ import {
   Cell,
 } from "recharts";
 import { useMemo, useState } from "react";
-import { KPI, MONTHLY_VOLUME, APPLICATIONS } from "../data/mockData";
+import { APPLICATIONS } from "../data/mockData";
+import { calendarBuckets } from "../data/derive";
+import {
+  serviceStatsFor,
+  statusCountsFor,
+  collectedIn,
+  previousRange,
+  appsIn,
+  completionDate,
+} from "../data/serviceStats";
 import { SERVICE_BY_ID, formatLak } from "../serviceConfig";
 import { StatusBadge } from "../components/StatusBadge";
 import { LaosMap } from "../components/LaosMap";
 import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 import {
-  deriveServices,
   PerServicePanel,
   SlaTracker,
   PipelineFunnel,
   ActivityFeed,
 } from "../components/OverviewWidgets";
 
-/* Registration status breakdown — palette validated for CVD separation. */
-const REG_COLORS: Record<string, { color: string; text: string }> = {
-  Approved: { color: "#3752AE", text: "#ffffff" },
-  Pending: { color: "#F59E0B", text: "#0F172A" },
-  Revision: { color: "#0EA5E9", text: "#0F172A" },
-  Failed: { color: "#EF4444", text: "#ffffff" },
-};
+/* Registration breakdown — the nine case statuses grouped into four buckets, so
+ * a slice always says which statuses it covers. Values come from the same split
+ * as the KPI cards, so donut and cards can never disagree.
+ * Palette validated for CVD separation (dataviz six checks — ALL PASS). */
+interface RegGroup {
+  name: string;
+  statuses: string[];
+  color: string;
+  key: "issued" | "awaiting" | "submitted" | "needs";
+}
 
-const REG_STATS = [
-  { name: "Approved", value: 71, color: REG_COLORS.Approved.color },
-  { name: "Pending", value: 23, color: REG_COLORS.Pending.color },
-  { name: "Revision", value: 1, color: REG_COLORS.Revision.color },
-  { name: "Failed", value: 5, color: REG_COLORS.Failed.color },
+const REG_GROUPS: RegGroup[] = [
+  { key: "issued", name: "Completed", statuses: ["Registered / Signed", "Issued"], color: "#10B981" },
+  { key: "awaiting", name: "Awaiting action", statuses: ["Certified", "Under Review"], color: "#3752AE" },
+  { key: "submitted", name: "Newly submitted", statuses: ["Draft", "Submitted"], color: "#0EA5E9" },
+  { key: "needs", name: "Needs correction", statuses: ["Returned", "Rejected", "Revoked"], color: "#C2410C" },
 ];
+
+export interface RegSlice extends RegGroup {
+  count: number;
+  pct: number;
+}
+
+function regBreakdown(parts: Record<RegGroup["key"], number>, total: number): RegSlice[] {
+  return REG_GROUPS.map((g) => ({
+    ...g,
+    count: parts[g.key],
+    pct: total > 0 ? Math.round((parts[g.key] / total) * 100) : 0,
+  }));
+}
 
 const YEAR = 2026;
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/* Keeps y-axis ticks short so they always fit the gutter (1200 → "1.2K"). */
+function compactNumber(v: number): string {
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  return String(v);
+}
+
 const RECEIVED_COLOR = "#3752AE";
 const COMPLETED_COLOR = "#10B981";
 
@@ -65,66 +97,31 @@ export interface TrendPoint {
   completed: number;
 }
 
-/* Application trend — bucket size follows the selected range:
- * ≤31 days → daily, ≤120 days → weekly, otherwise monthly. */
-function buildTrend(
-  range: DateRange,
-  total: number,
-  seed: number,
-): { points: TrendPoint[]; granularity: "day" | "week" | "month" } {
-  const allTime = !range.from && !range.to;
-  if (allTime) {
-    const points = MONTHLY_VOLUME.map((mo, i) => {
-      const sd = (seed * (i + 3)) >>> 0;
-      return {
-        label: mo.month,
-        received: mo.applications,
-        completed: Math.round(mo.applications * (0.58 + (sd % 18) / 100)),
-      };
-    });
-    return { points, granularity: "month" };
-  }
-
-  const from = range.from ? new Date(range.from) : new Date(YEAR, 0, 1);
-  const to = range.to ? new Date(range.to) : new Date();
-  const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000) + 1);
-
-  let granularity: "day" | "week" | "month";
-  let buckets: { label: string; weight: number }[];
-
-  if (days <= 31) {
-    granularity = "day";
-    buckets = Array.from({ length: days }, (_, i) => {
-      const d = new Date(from);
-      d.setDate(d.getDate() + i);
-      return { label: `${d.getMonth() + 1}/${d.getDate()}`, weight: 1 };
-    });
-  } else if (days <= 120) {
-    granularity = "week";
-    const n = Math.ceil(days / 7);
-    buckets = Array.from({ length: n }, (_, i) => {
-      const d = new Date(from);
-      d.setDate(d.getDate() + i * 7);
-      return { label: `${d.getMonth() + 1}/${d.getDate()}`, weight: Math.min(7, days - i * 7) };
-    });
-  } else {
-    granularity = "month";
-    buckets = [];
-    const cur = new Date(from.getFullYear(), from.getMonth(), 1);
-    while (cur <= to && buckets.length < 12) {
-      buckets.push({ label: `${MONTH_ABBR[cur.getMonth()]} '${String(cur.getFullYear()).slice(2)}`, weight: 30 });
-      cur.setMonth(cur.getMonth() + 1);
-    }
-  }
-
-  const wSum = buckets.reduce((a, b) => a + b.weight, 0) || 1;
-  const points = buckets.map((b, i) => {
-    const sd = (seed * (i + 7)) >>> 0;
-    const jitter = 0.75 + (sd % 50) / 100;
-    const received = Math.max(3, Math.round(((total * b.weight) / wSum) * jitter));
-    return { label: b.label, received, completed: Math.round(received * (0.55 + (sd % 20) / 100)) };
+/* Application trend — received vs completed, counted from the case rows and
+ * bucketed by the shared calendar helper so it matches every other chart. */
+function buildTrend(range: DateRange): { points: TrendPoint[]; granularity: "day" | "week" | "month" } {
+  const apps = appsIn(range);
+  const dates = APPLICATIONS.map((a) => a.submitted).sort();
+  const { buckets, granularity } = calendarBuckets(range, {
+    from: dates[0] ?? "",
+    to: dates[dates.length - 1] ?? "",
   });
 
+  const receivedByDay: Record<string, number> = {};
+  const completedByDay: Record<string, number> = {};
+  for (const a of apps) receivedByDay[a.submitted] = (receivedByDay[a.submitted] ?? 0) + 1;
+  /* Completions are counted on the day the case closed, from every case in the
+   * dataset — a case received before this period can still complete inside it. */
+  for (const a of APPLICATIONS) {
+    const done = completionDate(a);
+    if (done) completedByDay[done] = (completedByDay[done] ?? 0) + 1;
+  }
+
+  const points = buckets.map((b) => ({
+    label: b.label,
+    received: b.days.reduce((s, d) => s + (receivedByDay[d] ?? 0), 0),
+    completed: b.days.reduce((s, d) => s + (completedByDay[d] ?? 0), 0),
+  }));
   return { points, granularity };
 }
 
@@ -143,71 +140,66 @@ interface Metrics {
   submitted: number;
   feesLak: number;
   needs: number;
-  reg: { name: string; value: number; color: string }[];
+  reg: RegSlice[];
   deltas: { total: string; awaiting: string; issued: string };
   sub: string;
   seed: number;
 }
 
-/* Dummy metrics derived from the selected date range so the dashboard visibly reacts. */
-function metricsFor(range: DateRange): Metrics {
-  const allTime = !range.from && !range.to;
-  if (allTime) {
-    return {
-      total: KPI.totalApplications,
-      awaiting: KPI.awaitingAction,
-      issued: KPI.issuedThisMonth,
-      submitted: KPI.submittedToday,
-      feesLak: KPI.feesTodayLak,
-      needs: KPI.needsCorrection,
-      reg: REG_STATS,
-      deltas: { total: "+8.2%", awaiting: "+3.1%", issued: "+12.5%" },
-      sub: "all time",
-      seed: hashStr("all-time"),
-    };
-  }
-
-  const from = (range.from ? new Date(range.from) : new Date(YEAR, 0, 1)).getTime();
-  const to = (range.to ? new Date(range.to) : new Date()).getTime();
-  const DAY = 86400000;
-  const days = Math.max(1, Math.round((to - from) / DAY) + 1);
-  const seed = hashStr(`${range.from}|${range.to}`);
-
-  const rate = 55 + (seed % 25); // applications per day
-  const total = Math.max(240, Math.round(rate * days));
-  const approved = 60 + (seed % 12);
-  const failed = 3 + (seed % 5);
-  const revision = 1 + (seed % 3);
-  const pending = Math.max(0, 100 - approved - failed - revision);
-  const delta = (n: number) => `+${2 + (Math.floor(seed / n) % 14)}.${seed % 9}%`;
-
+/* The four state buckets, counted from the real case rows. They partition the
+ * nine statuses, so they always add back up to Total applications. */
+function bucketsFor(range: DateRange) {
+  const c = statusCountsFor(range);
   return {
-    total,
-    awaiting: Math.max(12, Math.round(total * 0.07)),
-    issued: Math.max(60, Math.round(total * 0.62)),
-    submitted: Math.max(8, Math.round(total * 0.11)),
-    feesLak: Math.max(200_000, Math.round(total * 8000)),
-    needs: Math.max(4, Math.round(total * 0.03)),
-    reg: [
-      { name: "Approved", value: approved, color: REG_COLORS.Approved.color },
-      { name: "Pending", value: pending, color: REG_COLORS.Pending.color },
-      { name: "Revision", value: revision, color: REG_COLORS.Revision.color },
-      { name: "Failed", value: failed, color: REG_COLORS.Failed.color },
-    ],
-    deltas: { total: delta(1), awaiting: delta(3), issued: delta(7) },
-    sub: "in selected period",
-    seed,
+    issued: c.registered + c.issued,
+    awaiting: c.certified + c["under-review"],
+    submitted: c.draft + c.submitted,
+    needs: c.returned + c.rejected + c.revoked,
   };
 }
 
+function pctDelta(now: number, before: number): string {
+  if (before === 0) return now === 0 ? "0%" : "+100%";
+  const d = ((now - before) / before) * 100;
+  return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`;
+}
+
+/* Every figure below is counted from APPLICATIONS / TRANSACTIONS, so the dashboard
+ * reconciles with Applications, Payments and Reports. */
+function metricsFor(range: DateRange): Metrics {
+  const parts = bucketsFor(range);
+  const total = parts.issued + parts.awaiting + parts.submitted + parts.needs;
+
+  const prev = previousRange(range);
+  const prevParts = bucketsFor(prev);
+  const prevTotal = prevParts.issued + prevParts.awaiting + prevParts.submitted + prevParts.needs;
+
+  return {
+    total,
+    ...parts,
+    feesLak: collectedIn(range),
+    reg: regBreakdown(parts, total),
+    deltas: {
+      total: pctDelta(total, prevTotal),
+      awaiting: pctDelta(parts.awaiting, prevParts.awaiting),
+      issued: pctDelta(parts.issued, prevParts.issued),
+    },
+    sub: !range.from && !range.to ? "all time" : "in selected period",
+    seed: hashStr(`${range.from}|${range.to}`),
+  };
+}
+
+/* Deltas are now real period-on-period changes, so they can be negative. */
 function DeltaBadge({ value, onDark = false }: { value: string; onDark?: boolean }) {
+  const down = value.startsWith("-");
+  const Icon = down ? ArrowDownRight : ArrowUpRight;
   return (
     <span
       className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${
-        onDark ? "bg-white/20 text-white" : "bg-emerald-100 text-emerald-700"
+        onDark ? "bg-white/20 text-white" : down ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"
       }`}
     >
-      <ArrowUpRight className="w-3.5 h-3.5" />
+      <Icon className="w-3.5 h-3.5" />
       {value}
     </span>
   );
@@ -218,11 +210,13 @@ function KpiBig({
   label,
   value,
   delta,
+  note,
 }: {
   filled?: boolean;
   label: string;
   value: string;
   delta: string;
+  note?: string;
 }) {
   return (
     <div
@@ -231,6 +225,7 @@ function KpiBig({
     >
       <p className={`text-sm ${filled ? "text-white/80" : "text-gray-500"}`}>{label}</p>
       <p className="text-3xl font-bold mt-2">{value}</p>
+      {note && <p className={`text-xs mt-1 ${filled ? "text-white/70" : "text-gray-400"}`}>{note}</p>}
       <div className="flex items-center gap-2 mt-3">
         <DeltaBadge value={delta} onDark={filled} />
         <span className={`text-xs ${filled ? "text-white/70" : "text-gray-400"}`}>vs previous period</span>
@@ -239,17 +234,29 @@ function KpiBig({
   );
 }
 
-function KpiSmall({ icon: Icon, label, value, tint, sub }: { icon: LucideIcon; label: string; value: string; tint: string; sub: string }) {
+/* `filled` gives the card a solid tinted background — used for Fees collected so
+ * it reads as a companion to the filled Total applications card above it. */
+function KpiSmall({
+  icon: Icon, label, value, tint, sub, filled = false,
+}: {
+  icon: LucideIcon; label: string; value: string; tint: string; sub: string; filled?: boolean;
+}) {
   return (
-    <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
+    <div
+      className={`rounded-2xl p-5 shadow-sm ${filled ? "text-white" : "bg-white border border-gray-100"}`}
+      style={filled ? { background: `linear-gradient(135deg, ${tint} 0%, #047857 100%)` } : undefined}
+    >
       <div className="flex items-center gap-3">
-        <span className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ backgroundColor: `${tint}1A` }}>
-          <Icon className="w-5 h-5" style={{ color: tint } as React.CSSProperties} />
+        <span
+          className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+          style={{ backgroundColor: filled ? "rgba(255,255,255,0.2)" : `${tint}1A` }}
+        >
+          <Icon className="w-5 h-5" style={{ color: filled ? "#ffffff" : tint } as React.CSSProperties} />
         </span>
-        <p className="text-sm text-gray-500">{label}</p>
+        <p className={`text-sm ${filled ? "text-white/80" : "text-gray-500"}`}>{label}</p>
       </div>
-      <p className="text-2xl font-bold text-gray-800 mt-3">{value}</p>
-      <p className="text-xs text-[#3752AE] mt-0.5">{sub}</p>
+      <p className={`text-2xl font-bold mt-3 ${filled ? "text-white" : "text-gray-800"}`}>{value}</p>
+      <p className={`text-xs mt-0.5 ${filled ? "text-white/70" : "text-[#3752AE]"}`}>{sub}</p>
     </div>
   );
 }
@@ -257,9 +264,10 @@ function KpiSmall({ icon: Icon, label, value, tint, sub }: { icon: LucideIcon; l
 export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void }) {
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const m = useMemo(() => metricsFor(dateRange), [dateRange]);
-  const services = useMemo(() => deriveServices(m.total, m.seed), [m.total, m.seed]);
-  const trend = useMemo(() => buildTrend(dateRange, m.total, m.seed), [dateRange, m.total, m.seed]);
+  const services = useMemo(() => serviceStatsFor(dateRange), [dateRange]);
+  const trend = useMemo(() => buildTrend(dateRange), [dateRange]);
   const useBars = trend.points.length <= 14;
+  const statusCounts = useMemo(() => statusCountsFor(dateRange), [dateRange]);
 
   const openCases = APPLICATIONS.filter((a) =>
     ["submitted", "certified", "under-review", "returned"].includes(a.status),
@@ -290,23 +298,29 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
 
       {/* KPI row 1 */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <KpiBig filled label="Total applications" value={m.total.toLocaleString()} delta={m.deltas.total} />
+        <KpiBig
+          filled
+          label="Total applications"
+          value={m.total.toLocaleString()}
+          delta={m.deltas.total}
+          note="Awaiting + Issued + Submitted + Needs correction"
+        />
         <KpiBig label="Awaiting action" value={m.awaiting.toLocaleString()} delta={m.deltas.awaiting} />
         <KpiBig label="Issued" value={m.issued.toLocaleString()} delta={m.deltas.issued} />
       </div>
 
       {/* KPI row 2 */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <KpiSmall filled icon={Banknote} label="Fees collected" value={formatLak(m.feesLak)} tint="#10B981" sub={m.sub} />
         <KpiSmall icon={Send} label="Submitted" value={m.submitted.toLocaleString()} tint="#0EA5E9" sub={m.sub} />
-        <KpiSmall icon={Banknote} label="Fees collected" value={formatLak(m.feesLak)} tint="#10B981" sub={m.sub} />
         <KpiSmall icon={AlertTriangle} label="Needs correction" value={m.needs.toLocaleString()} tint="#F59E0B" sub={m.sub} />
       </div>
 
       {/* Charts row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Monthly bar chart */}
-        <div className="lg:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <div className="flex items-start justify-between gap-4 mb-4">
+        <div className="lg:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
+          <div className="flex items-start justify-between gap-4 mb-4 flex-shrink-0">
             <div>
               <h2 className="text-base font-semibold text-gray-800">Application trend</h2>
               <p className="text-sm text-gray-400">
@@ -323,40 +337,43 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
               </span>
             </div>
           </div>
-          <ResponsiveContainer width="100%" height={260}>
-            {useBars ? (
-              <BarChart data={trend.points} margin={{ left: -12, right: 8, top: 8 }} barGap={2} barCategoryGap="28%">
-                <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
-                <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
-                <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={44} />
-                <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
-                <Bar dataKey="received" name="Received" fill={RECEIVED_COLOR} radius={[4, 4, 0, 0]} />
-                <Bar dataKey="completed" name="Completed" fill={COMPLETED_COLOR} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            ) : (
-              <LineChart data={trend.points} margin={{ left: -12, right: 8, top: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
-                <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} minTickGap={16} />
-                <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={44} />
-                <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
-                <Line type="monotone" dataKey="received" name="Received" stroke={RECEIVED_COLOR} strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="completed" name="Completed" stroke={COMPLETED_COLOR} strokeWidth={2} dot={false} />
-              </LineChart>
-            )}
-          </ResponsiveContainer>
+          {/* Fills the leftover card height so the bars line up with the donut card beside it. */}
+          <div className="flex-1 min-h-[260px]">
+            <ResponsiveContainer width="100%" height="100%">
+              {useBars ? (
+                <BarChart data={trend.points} margin={{ left: 4, right: 8, top: 8 }} barGap={2} barCategoryGap="28%">
+                  <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} />
+                  <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={52} tickFormatter={compactNumber} />
+                  <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
+                  <Bar dataKey="received" name="Received" fill={RECEIVED_COLOR} radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="completed" name="Completed" fill={COMPLETED_COLOR} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              ) : (
+                <LineChart data={trend.points} margin={{ left: 4, right: 8, top: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} minTickGap={16} />
+                  <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: "#9CA3AF" }} width={52} tickFormatter={compactNumber} />
+                  <Tooltip contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }} />
+                  <Line type="monotone" dataKey="received" name="Received" stroke={RECEIVED_COLOR} strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="completed" name="Completed" stroke={COMPLETED_COLOR} strokeWidth={2} dot={false} />
+                </LineChart>
+              )}
+            </ResponsiveContainer>
+          </div>
         </div>
 
         {/* Donut chart */}
         <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-800">Registration statistics</h2>
-          <p className="text-sm text-gray-400">Status breakdown</p>
+          <p className="text-sm text-gray-400">The nine case statuses, grouped</p>
 
           <div className="relative mt-2">
             <ResponsiveContainer width="100%" height={210}>
               <PieChart>
                 <Pie
                   data={m.reg}
-                  dataKey="value"
+                  dataKey="count"
                   nameKey="name"
                   cx="50%"
                   cy="50%"
@@ -371,7 +388,10 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
                   ))}
                 </Pie>
                 <Tooltip
-                  formatter={(v: number) => `${v}%`}
+                  formatter={(v: number, name, item) => [
+                    `${v.toLocaleString()} cases · ${(item?.payload as RegSlice | undefined)?.statuses.join(", ")}`,
+                    name as string,
+                  ]}
                   contentStyle={{ borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 }}
                 />
               </PieChart>
@@ -383,23 +403,26 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
             </div>
           </div>
 
-          {/* Legend rows */}
+          {/* Legend rows — each names the statuses it groups, so the buckets
+              can be traced back to the Applications status filter. */}
           <div className="mt-4 space-y-2">
-            {m.reg.map((s) => {
-              const count = Math.round((m.total * s.value) / 100);
-              return (
-                <div key={s.name} className="flex items-center gap-3">
-                  <span
-                    className="w-12 h-8 rounded-lg flex items-center justify-center text-xs font-bold flex-shrink-0"
-                    style={{ backgroundColor: s.color, color: REG_COLORS[s.name]?.text ?? "#ffffff" }}
-                  >
-                    {s.value}%
+            {m.reg.map((s) => (
+              <div key={s.name} className="flex items-center gap-3">
+                <span
+                  className="w-12 h-8 rounded-lg flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
+                  style={{ backgroundColor: s.color }}
+                >
+                  {s.pct}%
+                </span>
+                <span className="flex-1 min-w-0">
+                  <span className="block text-sm text-gray-700 truncate">{s.name}</span>
+                  <span className="block text-[11px] text-gray-400 truncate" title={s.statuses.join(" · ")}>
+                    {s.statuses.join(" · ")}
                   </span>
-                  <span className="flex-1 text-sm text-gray-600 truncate">{s.name}</span>
-                  <span className="text-sm font-semibold text-gray-800 tabular-nums">{count.toLocaleString()}</span>
-                </div>
-              );
-            })}
+                </span>
+                <span className="text-sm font-semibold text-gray-800 tabular-nums">{s.count.toLocaleString()}</span>
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -409,13 +432,13 @@ export function OverviewPage({ onOpenCase }: { onOpenCase: (id: string) => void 
         <div className="lg:col-span-2">
           <PerServicePanel services={services} />
         </div>
-        <SlaTracker services={services} total={m.total} seed={m.seed} />
+        <SlaTracker services={services} />
       </div>
 
       {/* Pipeline funnel + activity feed */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
         <div className="lg:col-span-2 h-full">
-          <PipelineFunnel total={m.total} seed={m.seed} />
+          <PipelineFunnel counts={statusCounts} />
         </div>
         <ActivityFeed />
       </div>

@@ -10,19 +10,15 @@ import {
 import { toast } from "sonner";
 import {
   TRANSACTIONS, DEFAULT_METHODS, DEFAULT_PRICING, KIND_LABEL, TX_STATUS_META,
-  METHOD_OPTIONS, TX_STATUS_OPTIONS, SERVICE_OPTIONS, serviceLabel, formatLakShort,
+  METHOD_OPTIONS, TX_STATUS_OPTIONS, SERVICE_OPTIONS, METHOD_COLOR, serviceLabel, formatLakShort,
   type Transaction, type PaymentMethod, type ServicePricing, type TxStatus,
 } from "../data/payments";
 import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
+import { PROVINCE_STATS } from "../data/mockData";
+import { calendarBuckets } from "../data/derive";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
 import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 import { Switch } from "../components/ui/switch";
-
-/* Validated categorical palette (dataviz six checks — ALL PASS in this order). */
-const METHOD_COLORS = ["#3752AE", "#10B981", "#F59E0B", "#EC4899", "#0EA5E9", "#8B5CF6"];
-const METHOD_COLOR: Record<string, string> = Object.fromEntries(
-  DEFAULT_METHODS.map((m, i) => [m.id, METHOD_COLORS[i % METHOD_COLORS.length]]),
-);
 
 const METHOD_ICON: Record<PaymentMethod["kind"], React.ComponentType<{ className?: string }>> = {
   wallet: Wallet,
@@ -30,6 +26,8 @@ const METHOD_ICON: Record<PaymentMethod["kind"], React.ComponentType<{ className
   qr: QrCode,
   cash: Coins,
 };
+
+const PROVINCE_OPTIONS = Object.keys(PROVINCE_STATS).map((p) => ({ value: p, label: p }));
 
 const TABS = [
   { id: "overview", label: "Revenue overview" },
@@ -100,6 +98,7 @@ function exportCsv(rows: Transaction[]) {
 export function PaymentsPage() {
   const [tab, setTab] = useState<Tab>("overview");
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
+  const [provinces, setProvinces] = useState<string[]>([]);
 
   // Transaction filters
   const [query, setQuery] = useState("");
@@ -114,8 +113,15 @@ export function PaymentsPage() {
   const [pricing, setPricing] = useState<ServicePricing[]>(DEFAULT_PRICING);
   const [dirty, setDirty] = useState(false);
 
-  /* The date range drives every revenue figure on the overview. */
-  const inScope = useMemo(() => TRANSACTIONS.filter((t) => inRange(t.date, dateRange)), [dateRange]);
+  /* Date range and province drive every revenue figure on the overview, and the
+   * transaction list inherits both so the two tabs always agree. */
+  const inScope = useMemo(
+    () =>
+      TRANSACTIONS.filter(
+        (t) => inRange(t.date, dateRange) && (provinces.length === 0 || provinces.includes(t.province)),
+      ),
+    [dateRange, provinces],
+  );
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -128,7 +134,7 @@ export function PaymentsPage() {
     });
   }, [inScope, query, services, methods, statuses]);
 
-  useEffect(() => setPage(1), [query, services, methods, statuses, dateRange, pageSize]);
+  useEffect(() => setPage(1), [query, services, methods, statuses, dateRange, provinces, pageSize]);
 
   const totalRows = rows.length;
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
@@ -145,25 +151,25 @@ export function PaymentsPage() {
   const collectionRate = billed > 0 ? (collected / billed) * 100 : 0;
   const avgTicket = paid.length ? collected / paid.length : 0;
 
-  /* Daily revenue — collapses to weekly buckets on long ranges so bars stay readable. */
+  /* Revenue over time — buckets come from the shared calendar helper, so the bar
+   * count depends only on the date filter, never on which days happen to have a
+   * receipt. Days without receipts plot as zero. */
   const trend = useMemo(() => {
     const byDay: Record<string, number> = {};
     for (const t of paid) byDay[t.date] = (byDay[t.date] ?? 0) + t.amount;
-    const days = Object.keys(byDay).sort();
-    if (days.length <= 31) {
-      return days.map((d) => ({ label: `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`, revenue: byDay[d] }));
-    }
-    const buckets: { label: string; revenue: number }[] = [];
-    for (let i = 0; i < days.length; i += 7) {
-      const chunk = days.slice(i, i + 7);
-      const d = chunk[0];
-      buckets.push({
-        label: `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`,
-        revenue: chunk.reduce((s, k) => s + byDay[k], 0),
-      });
-    }
-    return buckets;
-  }, [paid]);
+    const allDates = TRANSACTIONS.map((t) => t.date).sort();
+    const { buckets, granularity } = calendarBuckets(dateRange, {
+      from: allDates[0] ?? "",
+      to: allDates[allDates.length - 1] ?? "",
+    });
+    return {
+      points: buckets.map((b) => ({
+        label: b.label,
+        revenue: b.days.reduce((s, d) => s + (byDay[d] ?? 0), 0),
+      })),
+      granularity,
+    };
+  }, [paid, dateRange]);
 
   const byService = useMemo(() => {
     const acc: Record<string, { collected: number; outstanding: number; count: number }> = {};
@@ -177,6 +183,19 @@ export function PaymentsPage() {
     return SERVICES.map((s) => ({ service: s, ...acc[s.id] })).sort((a, b) => b.collected - a.collected);
   }, [inScope]);
   const maxService = Math.max(1, ...byService.map((r) => r.collected));
+
+  const byProvince = useMemo(() => {
+    const acc: Record<string, { collected: number; count: number }> = {};
+    for (const t of paid) {
+      acc[t.province] = acc[t.province] ?? { collected: 0, count: 0 };
+      acc[t.province].collected += t.amount;
+      acc[t.province].count += 1;
+    }
+    return Object.entries(acc)
+      .map(([province, v]) => ({ province, ...v }))
+      .sort((a, b) => b.collected - a.collected);
+  }, [paid]);
+  const maxProvince = Math.max(1, ...byProvince.map((r) => r.collected));
 
   const byMethod = useMemo(() => {
     const acc: Record<string, number> = {};
@@ -225,8 +244,18 @@ export function PaymentsPage() {
             Fee collection, receipts and reconciliation across the fee-bearing services.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          {tab !== "settings" && <DateRangeFilter onChange={setDateRange} />}
+        <div className="flex flex-wrap items-center gap-2">
+          {tab !== "settings" && (
+            <>
+              <MultiSelectFilter
+                label="Province"
+                options={PROVINCE_OPTIONS}
+                selected={provinces}
+                onChange={setProvinces}
+              />
+              <DateRangeFilter onChange={setDateRange} />
+            </>
+          )}
           {tab === "transactions" && (
             <button
               onClick={() => exportCsv(rows)}
@@ -275,14 +304,18 @@ export function PaymentsPage() {
 
           <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
             {/* Revenue trend */}
-            <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-              <h2 className="text-base font-semibold text-gray-800">Revenue collected</h2>
-              <p className="text-sm text-gray-400 mb-3">
-                {trend.length <= 31 ? "Per day" : "Per week"} · {lak(collected)} total
-              </p>
-              <div className="h-64">
+            <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
+              <div className="flex-shrink-0">
+                <h2 className="text-base font-semibold text-gray-800">Revenue collected</h2>
+                <p className="text-sm text-gray-400 mb-3">
+                  {trend.granularity === "day" ? "Per day" : trend.granularity === "week" ? "Per week" : "Per month"} · {lak(collected)} total
+                </p>
+              </div>
+              {/* Fills the leftover card height so the bars line up with the
+                  payment-method card beside it. */}
+              <div className="flex-1 min-h-[256px]">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={trend} margin={{ top: 4, right: 8, bottom: 0, left: 4 }}>
+                  <BarChart data={trend.points} margin={{ top: 4, right: 8, bottom: 0, left: 4 }}>
                     <CartesianGrid vertical={false} stroke="#F1F5F9" />
                     <XAxis dataKey="label" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
                     <YAxis tickFormatter={formatLakShort} tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={44} />
@@ -330,8 +363,9 @@ export function PaymentsPage() {
             </div>
           </div>
 
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
           {/* Revenue by service */}
-          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
             <div className="px-5 py-4 border-b border-gray-100">
               <h2 className="text-base font-semibold text-gray-800">Revenue by service</h2>
               <p className="text-sm text-gray-400">Collected, outstanding, and current tariff</p>
@@ -378,6 +412,39 @@ export function PaymentsPage() {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          {/* Revenue by province — the counterpart to the Province filter above */}
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
+            <h2 className="text-base font-semibold text-gray-800">Revenue by province</h2>
+            <p className="text-sm text-gray-400 mb-4">
+              {provinces.length > 0
+                ? `Filtered to ${provinces.length} province${provinces.length !== 1 ? "s" : ""}`
+                : `${byProvince.length} provinces collecting fees`}
+            </p>
+            <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
+              {byProvince.map((r) => (
+                <div key={r.province}>
+                  <div className="flex items-center justify-between gap-2 text-sm mb-1">
+                    <span className="text-gray-600 truncate">{r.province}</span>
+                    <span className="font-medium text-gray-800 whitespace-nowrap tabular-nums">
+                      {formatLakShort(r.collected)}
+                    </span>
+                  </div>
+                  <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-[#3752AE]"
+                      style={{ width: `${(r.collected / maxProvince) * 100}%` }}
+                    />
+                  </div>
+                  <p className="text-[11px] text-gray-400 mt-0.5">{r.count} receipts</p>
+                </div>
+              ))}
+              {byProvince.length === 0 && (
+                <p className="text-sm text-gray-400 text-center py-8">No revenue in this selection.</p>
+              )}
+            </div>
+          </div>
           </div>
         </>
       )}
@@ -589,7 +656,7 @@ export function PaymentsPage() {
             <div className="px-5 py-4 border-b border-gray-100">
               <h2 className="text-base font-semibold text-gray-800">Service pricing</h2>
               <p className="text-sm text-gray-400">
-                Tariffs in LAK. Set a fee to 0 to make the service free — birth and death declarations are free by law.
+                Tariffs in LAK. Set a fee to 0 to make a service free of charge.
               </p>
             </div>
             <div className="overflow-x-auto">

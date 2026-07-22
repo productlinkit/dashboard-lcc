@@ -31,6 +31,13 @@ export const DEFAULT_METHODS: PaymentMethod[] = [
   { id: "cash", label: "Cash at office", kind: "cash", enabled: true, feePercent: 0, settlement: "District cash book", note: "Receipt issued at the counter; banked daily." },
 ];
 
+/* Validated categorical palette (dataviz six checks — ALL PASS in this order).
+ * Shared so Payments and Reports colour a method identically. */
+export const METHOD_PALETTE = ["#3752AE", "#10B981", "#F59E0B", "#EC4899", "#0EA5E9", "#8B5CF6"];
+export const METHOD_COLOR: Record<string, string> = Object.fromEntries(
+  DEFAULT_METHODS.map((m, i) => [m.id, METHOD_PALETTE[i % METHOD_PALETTE.length]]),
+);
+
 export const METHOD_BY_ID: Record<string, PaymentMethod> = Object.fromEntries(
   DEFAULT_METHODS.map((m) => [m.id, m]),
 );

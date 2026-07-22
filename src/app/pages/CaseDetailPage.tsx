@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { toPng } from "html-to-image";
 import { jsPDF } from "jspdf";
 import {
@@ -25,8 +25,10 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  Stamp as StampIcon,
 } from "lucide-react";
 import { SignaturePad, SignatureMark, type Signature } from "../components/SignaturePad";
+import { StampPad, StampMark, type Stamp } from "../components/StampPad";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -649,18 +651,124 @@ function GenericCertificate({ app }: { app: Application }) {
   );
 }
 
+/* Draggable stamp overlay. Stamps live in page coordinates inside the certificate
+ * body, so they can be placed anywhere on the document, not just near the
+ * signature. A stamp with no position yet is anchored to the left of the
+ * signature block — the conventional spot on a Lao certificate. */
+function StampLayer({
+  stamps,
+  onChange,
+  bodyRef,
+  anchorRef,
+}: {
+  stamps: Stamp[];
+  onChange: (next: Stamp[]) => void;
+  bodyRef: React.RefObject<HTMLDivElement | null>;
+  anchorRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const drag = useRef<{ id: string; dx: number; dy: number } | null>(null);
+
+  /* Place any newly added stamp beside the signature, cascading if there are
+   * several so they never land exactly on top of each other. */
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    const anchor = anchorRef.current;
+    if (!body || !anchor) return;
+    const pending = stamps.filter((s) => s.x == null || s.y == null);
+    if (pending.length === 0) return;
+
+    const b = body.getBoundingClientRect();
+    const a = anchor.getBoundingClientRect();
+    let placed = stamps.length - pending.length;
+    onChange(
+      stamps.map((s) => {
+        if (s.x != null && s.y != null) return s;
+        const offset = placed * 18;
+        placed += 1;
+        return {
+          ...s,
+          x: Math.max(8, a.left - b.left - s.size - 20 + offset),
+          y: Math.max(8, a.top - b.top + 6 + offset),
+        };
+      }),
+    );
+  }, [stamps, onChange, bodyRef, anchorRef]);
+
+  function startDrag(e: React.PointerEvent<HTMLDivElement>, s: Stamp) {
+    const b = bodyRef.current?.getBoundingClientRect();
+    if (!b) return;
+    drag.current = { id: s.id, dx: e.clientX - b.left - (s.x ?? 0), dy: e.clientY - b.top - (s.y ?? 0) };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+
+  function onMove(e: React.PointerEvent<HTMLDivElement>) {
+    const d = drag.current;
+    const b = bodyRef.current?.getBoundingClientRect();
+    if (!d || !b) return;
+    onChange(
+      stamps.map((s) =>
+        s.id === d.id
+          ? {
+              ...s,
+              x: Math.min(Math.max(0, e.clientX - b.left - d.dx), b.width - s.size),
+              y: Math.min(Math.max(0, e.clientY - b.top - d.dy), b.height - s.size),
+            }
+          : s,
+      ),
+    );
+  }
+
+  return (
+    <>
+      {stamps.map((s) =>
+        s.x == null || s.y == null ? null : (
+          <div
+            key={s.id}
+            onPointerDown={(e) => startDrag(e, s)}
+            onPointerMove={onMove}
+            onPointerUp={() => (drag.current = null)}
+            onPointerCancel={() => (drag.current = null)}
+            style={{ left: s.x, top: s.y, width: s.size, height: s.size }}
+            className="absolute z-10 cursor-move touch-none group"
+            title="Drag to reposition"
+          >
+            <StampMark stamp={s} />
+            <button
+              data-pdf-exclude="true"
+              // Stops the parent's drag handler from swallowing the click.
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => onChange(stamps.filter((x) => x.id !== s.id))}
+              title="Remove stamp"
+              className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-white border border-gray-200 text-gray-400 text-xs leading-none opacity-0 group-hover:opacity-100 hover:text-red-600 shadow-sm"
+            >
+              ×
+            </button>
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
 /* Resident Certificate — laid out to match the official RC form. */
 function ResidentCertificate({
   app,
   values,
   signature,
   onSign,
+  stamps,
+  onStampsChange,
 }: {
   app: Application;
   values: Record<string, string>;
   signature: Signature | null;
   onSign: () => void;
+  stamps: Stamp[];
+  onStampsChange: (next: Stamp[]) => void;
 }) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const signatureRef = useRef<HTMLDivElement>(null);
   const v = (section: string, en: string) => values[fieldKey(section, null, en)] ?? "";
   const province = v("Header & jurisdiction", "Province") || app.province;
   const district = v("Header & jurisdiction", "District");
@@ -685,7 +793,8 @@ function ResidentCertificate({
 
   return (
     <div className="bg-white">
-      <div className="px-10 py-8 text-[13px] leading-7 text-slate-800">
+      <div ref={bodyRef} className="relative px-10 py-8 text-[13px] leading-7 text-slate-800">
+        <StampLayer stamps={stamps} onChange={onStampsChange} bodyRef={bodyRef} anchorRef={signatureRef} />
         {/* Emblem + national header */}
         <div className="flex flex-col items-center">
           <Emblem />
@@ -735,7 +844,7 @@ function ResidentCertificate({
           <div className="border border-gray-200 rounded p-1.5">
             <QrCode value={verifyUrl} size={92} />
           </div>
-          <div className="text-center min-w-44">
+          <div ref={signatureRef} className="text-center min-w-44">
             <p>ວັນທີ {issued}</p>
             <p className="font-bold mt-1">ຫົວໜ້າບ້ານ</p>
             <div className="h-20 flex items-center justify-center">
@@ -797,6 +906,8 @@ function CertificateDialog({
   onClose,
   signature,
   onSignatureChange,
+  stamps,
+  onStampsChange,
   submitted,
   onSubmit,
 }: {
@@ -806,11 +917,14 @@ function CertificateDialog({
   onClose: () => void;
   signature: Signature | null;
   onSignatureChange: (s: Signature) => void;
+  stamps: Stamp[];
+  onStampsChange: (next: Stamp[]) => void;
   submitted: boolean;
   onSubmit: () => void;
 }) {
   const svc = SERVICE_BY_ID[app.serviceId];
   const [padOpen, setPadOpen] = useState(false);
+  const [stampOpen, setStampOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const certRef = useRef<HTMLDivElement>(null);
   const showSubmit = svc.id === "resident";
@@ -839,7 +953,14 @@ function CertificateDialog({
 
           <div ref={certRef}>
             {svc.id === "resident" ? (
-              <ResidentCertificate app={app} values={values} signature={signature} onSign={() => setPadOpen(true)} />
+              <ResidentCertificate
+                app={app}
+                values={values}
+                signature={signature}
+                onSign={() => setPadOpen(true)}
+                stamps={stamps}
+                onStampsChange={onStampsChange}
+              />
             ) : (
               <GenericCertificate app={app} />
             )}
@@ -854,6 +975,19 @@ function CertificateDialog({
               <button className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200">
                 <Printer className="w-4 h-4" /> Print
               </button>
+              {showSubmit && (
+                <button
+                  onClick={() => setStampOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                >
+                  <StampIcon className="w-4 h-4" /> Add stamp
+                  {stamps.length > 0 && (
+                    <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-[#3752AE] text-white">
+                      {stamps.length}
+                    </span>
+                  )}
+                </button>
+              )}
               <button
                 onClick={handleDownload}
                 disabled={generating}
@@ -887,6 +1021,11 @@ function CertificateDialog({
       </Dialog>
 
       <SignaturePad open={padOpen} onClose={() => setPadOpen(false)} onApply={onSignatureChange} />
+      <StampPad
+        open={stampOpen}
+        onClose={() => setStampOpen(false)}
+        onApply={(s) => onStampsChange([...stamps, s])}
+      />
     </>
   );
 }
@@ -940,6 +1079,7 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
   const [backup, setBackup] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [signature, setSignature] = useState<Signature | null>(null);
+  const [stamps, setStamps] = useState<Stamp[]>([]);
 
   const validation = useMemo(() => {
     const errorKeys = new Set<string>();
@@ -1221,6 +1361,8 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
         onClose={() => setCertOpen(false)}
         signature={signature}
         onSignatureChange={setSignature}
+        stamps={stamps}
+        onStampsChange={setStamps}
         submitted={certSubmitted}
         onSubmit={submitCertificate}
       />

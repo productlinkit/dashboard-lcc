@@ -1,3 +1,6 @@
+import { SERVICE_BY_ID } from "../serviceConfig";
+import { processingDaysFor } from "./derive";
+
 /*
  * Demo data for the admin dashboard. Static / deterministic so the UI is stable.
  */
@@ -169,23 +172,44 @@ const GEN_SURNAMES = [
   "Chanthaphone", "Xaiyavong", "Souphanousinh", "Namvong", "Rasphone", "Thammavong",
 ];
 const GEN_OFFICERS = ["Khamla P.", "Vilai S.", "Somsy T.", "Bounma K.", "Latda S.", "Noy K."];
-/* 20 slots — the mix roughly matches a real office: most cases end up issued,
- * but ~40% sit in the three stages that wait on an officer (approval queue). */
-const GEN_STATUS_POOL: AppStatus[] = [
-  "issued", "issued", "issued", "issued", "issued",
-  "registered", "registered",
-  "under-review", "under-review", "under-review",
+/* Status depends on how old a case is, not on an independent draw: anything from
+ * the last few weeks is still being worked on, older cases have been closed out.
+ * Both pools are 11 long — coprime with the 120-day window below, so a given
+ * calendar day doesn't always land on the same status. */
+const OPEN_STATUS_POOL: AppStatus[] = [
   "submitted", "submitted", "submitted",
+  "under-review", "under-review", "under-review",
   "certified", "certified",
   "returned", "returned",
-  "draft", "rejected", "revoked",
+  "draft",
 ];
-/* Statuses still waiting on an officer — kept recent so SLA ageing is realistic. */
-const PENDING_STATUSES = new Set<AppStatus>(["draft", "submitted", "certified", "under-review", "returned"]);
-const SVC_IDS = ["resident", "birth", "death", "marriage", "divorce", "family-book"];
+/* 29 slots — coprime with the 119-day window. Revocation is rare in practice, so
+ * it gets a single slot rather than the same weight as a rejection. */
+const CLOSED_STATUS_POOL: AppStatus[] = [
+  ...Array(21).fill("issued"),
+  ...Array(5).fill("registered"),
+  ...Array(2).fill("rejected"),
+  "revoked",
+] as AppStatus[];
+
+/* 13 slots, weighted the way an office actually sees them. Coprime with both the
+ * window and the status pools, so service, date and status stay uncorrelated —
+ * otherwise every Tuesday would be a marriage and revenue would spike weekly. */
+const SVC_POOL = [
+  "resident", "resident", "resident", "resident",
+  "birth", "birth", "birth",
+  "death", "death",
+  "marriage", "marriage",
+  "divorce",
+  "family-book",
+];
 const SVC_PREFIX: Record<string, string> = {
   resident: "RC", birth: "BD", death: "DD", marriage: "MC", divorce: "DV", "family-book": "FB",
 };
+
+/* 119 days of history — a whole number of weeks, so weekly chart buckets all
+ * cover seven real days and none renders as a stub bar. */
+const GEN_WINDOW_DAYS = 119;
 
 function pad2(n: number): string {
   return String(n).padStart(2, "0");
@@ -195,13 +219,21 @@ function generateApplications(count: number): Application[] {
   const out: Application[] = [];
   const base = new Date(); // rolling window ending today, so dates are never in the future
   for (let i = 0; i < count; i++) {
-    const svc = SVC_IDS[i % SVC_IDS.length];
+    // Stride 47 is coprime with the window, so cases land evenly on every day of
+    // it rather than bunching up — bunching is what produced revenue spikes.
+    const daysAgo = (i * 47) % GEN_WINDOW_DAYS;
+    const svc = SVC_POOL[(i * 5) % SVC_POOL.length];
     const id = `${SVC_PREFIX[svc]}-2026-${String(3100 + i).padStart(6, "0")}`;
-    // Stride 7 is coprime with the 20-slot pool, so every status is used.
-    const status = GEN_STATUS_POOL[(i * 7) % GEN_STATUS_POOL.length];
+    // A case is closed once its own processing time has elapsed — not at a fixed
+    // cut-off. Otherwise no recent case would ever be finished and the completed
+    // series would collapse to zero at the right-hand edge of every chart.
+    const target = SERVICE_BY_ID[svc]?.slaDays ?? 7;
+    const pool = daysAgo >= Math.ceil(processingDaysFor(id, svc, target))
+      ? CLOSED_STATUS_POOL
+      : OPEN_STATUS_POOL;
+    const status = pool[(i * 7) % pool.length];
     const d = new Date(base);
-    // Open cases are days old; closed ones spread across the last ~4 months.
-    d.setDate(d.getDate() - (PENDING_STATUSES.has(status) ? (i * 13) % 12 : ((i * 13) % 118) + 2));
+    d.setDate(d.getDate() - daysAgo);
     const submitted = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     const hasOfficer = !(status === "draft" || status === "submitted");
     out.push({
@@ -219,17 +251,15 @@ function generateApplications(count: number): Application[] {
   return out;
 }
 
-export const APPLICATIONS: Application[] = [...SEED_APPLICATIONS, ...generateApplications(260)];
+export const APPLICATIONS: Application[] = [...SEED_APPLICATIONS, ...generateApplications(3000)];
 
-/* KPI tiles on the overview page */
+/* KPI tiles on the overview page. The four state buckets (awaiting, issued,
+ * submitted, needs correction) are split from totalApplications on the page so
+ * they always add back up to it — see splitTotal() in OverviewPage. */
 export const KPI = {
   totalApplications: 4821,
-  awaitingAction: 312, // not yet issued/closed (draft → under-review)
-  issuedThisMonth: 1894,
   revenueLak: 78_540_000,
-  submittedToday: 176,
   feesTodayLak: 2_540_000,
-  needsCorrection: 48, // returned / rejected awaiting rework
 };
 
 /* Applications submitted per day, last 7 days */

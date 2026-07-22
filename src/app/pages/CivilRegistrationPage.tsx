@@ -169,19 +169,21 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                 <span className="text-xs font-medium text-gray-500 whitespace-nowrap">{formatLak(s.fee)}</span>
               </div>
 
+              {/* Colours match the certificate chips in the table below:
+                  blue = on the register, green = issued, amber = still moving. */}
               <div className="grid grid-cols-3 gap-2 mt-4 pt-3 border-t border-gray-50">
-                <div>
-                  <p className="text-lg font-bold text-gray-800 leading-tight">{stat.registered}</p>
-                  <p className="text-[11px] text-gray-400">In register</p>
-                </div>
-                <div>
-                  <p className="text-lg font-bold text-gray-800 leading-tight">{stat.issued}</p>
-                  <p className="text-[11px] text-gray-400">Issued</p>
-                </div>
-                <div>
-                  <p className="text-lg font-bold text-gray-800 leading-tight">{stat.pending}</p>
-                  <p className="text-[11px] text-gray-400">In progress</p>
-                </div>
+                {[
+                  { label: "In register", value: stat.registered, color: "#3752AE" },
+                  { label: "Issued", value: stat.issued, color: "#047857" },
+                  { label: "In progress", value: stat.pending, color: "#B45309" },
+                ].map((k) => (
+                  <div key={k.label}>
+                    <p className="text-lg font-bold leading-tight" style={{ color: k.color }}>
+                      {k.value}
+                    </p>
+                    <p className="text-[11px] text-gray-400">{k.label}</p>
+                  </div>
+                ))}
               </div>
             </button>
           );
