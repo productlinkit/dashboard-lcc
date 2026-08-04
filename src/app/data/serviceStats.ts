@@ -61,9 +61,9 @@ export interface ServiceStat {
 
 const IN_PROGRESS: AppStatus[] = ["draft", "submitted", "certified", "under-review", "returned"];
 
-export function serviceStatsFor(range: DateRange): ServiceStat[] {
-  const apps = APPLICATIONS.filter((a) => inRange(a.submitted, range));
-  const tx = TRANSACTIONS.filter((t) => inRange(t.date, range));
+export function serviceStatsFor(range: DateRange, province?: string | null): ServiceStat[] {
+  const apps = APPLICATIONS.filter((a) => inRange(a.submitted, range) && (!province || a.province === province));
+  const tx = TRANSACTIONS.filter((t) => inRange(t.date, range) && (!province || t.province === province));
 
   return SERVICES.map((svc) => {
     const rows = apps.filter((a) => a.serviceId === svc.id);
@@ -96,8 +96,10 @@ export function serviceStatsFor(range: DateRange): ServiceStat[] {
 }
 
 /** Overall turnaround across every closed case in the range. */
-export function overallTurnaround(range: DateRange): { avgDays: number; sla: number; overdue: number; closed: number } {
-  const apps = APPLICATIONS.filter((a) => inRange(a.submitted, range) && CLOSED_STATUSES.includes(a.status));
+export function overallTurnaround(range: DateRange, province?: string | null): { avgDays: number; sla: number; overdue: number; closed: number } {
+  const apps = APPLICATIONS.filter(
+    (a) => inRange(a.submitted, range) && CLOSED_STATUSES.includes(a.status) && (!province || a.province === province),
+  );
   const times = apps.map((a) => processingDays(a, SERVICE_BY_ID[a.serviceId]?.slaDays ?? 7));
   const within = apps.filter((a) => {
     const target = SERVICE_BY_ID[a.serviceId]?.slaDays ?? 7;

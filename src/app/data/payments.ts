@@ -169,6 +169,34 @@ function buildTransactions(): Transaction[] {
 
 export const TRANSACTIONS: Transaction[] = buildTransactions();
 
+/*
+ * Payment state per application. Every fee-bearing service raises exactly one
+ * service-fee receipt, so an application's payment state is that receipt's status;
+ * free services never raise one and read "No fee".
+ */
+export type PaymentState = "paid" | "pending" | "failed" | "refunded" | "free";
+
+export const PAYMENT_STATE_META: Record<PaymentState, { label: string; color: string; bg: string }> = {
+  paid: { label: "Paid", color: "#047857", bg: "#D1FAE5" },
+  pending: { label: "Pending", color: "#B45309", bg: "#FEF3C7" },
+  failed: { label: "Failed", color: "#B91C1C", bg: "#FEE2E2" },
+  refunded: { label: "Refunded", color: "#6D28D9", bg: "#EDE9FE" },
+  free: { label: "No fee", color: "#64748B", bg: "#F1F5F9" },
+};
+
+const SERVICE_FEE_STATE: Record<string, TxStatus> = {};
+for (const t of TRANSACTIONS) if (t.kind === "service-fee") SERVICE_FEE_STATE[t.applicationId] = t.status;
+
+export function paymentStateFor(appId: string): PaymentState {
+  return SERVICE_FEE_STATE[appId] ?? "free";
+}
+
+export const PAYMENT_OPTIONS = (Object.keys(PAYMENT_STATE_META) as PaymentState[]).map((k) => ({
+  value: k,
+  label: PAYMENT_STATE_META[k].label,
+  color: PAYMENT_STATE_META[k].color,
+}));
+
 export const SERVICE_OPTIONS = SERVICES.map((s) => ({ value: s.id, label: s.label, color: s.color }));
 export const METHOD_OPTIONS = DEFAULT_METHODS.map((m) => ({ value: m.id, label: m.label }));
 export const TX_STATUS_OPTIONS = (Object.keys(TX_STATUS_META) as TxStatus[]).map((k) => ({

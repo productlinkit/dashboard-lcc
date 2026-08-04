@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search, Eye, Download, ChevronLeft, ChevronRight, BadgeCheck, Ban, Clock } from "lucide-react";
-import { APPLICATIONS, STATUS_META, type AppStatus, type Application } from "../data/mockData";
+import { APPLICATIONS, eventDateOf, lastActivityOf, type AppStatus, type Application } from "../data/mockData";
 import { SERVICES, SERVICE_BY_ID, formatLak } from "../serviceConfig";
-import { StatusBadge } from "../components/StatusBadge";
 import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 
 /*
@@ -10,9 +9,11 @@ import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../component
  * A register entry exists once an event is registered; it may then be issued as
  * a certificate, or later revoked. Everything before that still sits in the
  * approval queue, not here.
+ *
+ * Two dates matter and they differ: the event date (when the birth/death/…
+ * happened) and the registration date (when it was recorded in the book).
  */
 const REGISTER_STATUSES = new Set<AppStatus>(["registered", "issued", "revoked"]);
-const PENDING_STATUSES = new Set<AppStatus>(["draft", "submitted", "certified", "under-review", "returned"]);
 
 const SVC_BOOK: Record<string, string> = {
   resident: "RES",
@@ -23,16 +24,19 @@ const SVC_BOOK: Record<string, string> = {
   "family-book": "FAM",
 };
 
-/* Register numbers are sequential per service book, in registration order. */
-function buildRegister(): (Application & { regNo: string })[] {
+type RegisterEntry = Application & { regNo: string; registered: string };
+
+/* Register numbers are sequential per service book, assigned in the order events
+ * were recorded — so they follow the registration date, not the filing date. */
+function buildRegister(): RegisterEntry[] {
   const counters: Record<string, number> = {};
   return APPLICATIONS.filter((a) => REGISTER_STATUSES.has(a.status))
-    .slice()
-    .sort((a, b) => a.submitted.localeCompare(b.submitted))
+    .map((a) => ({ ...a, registered: lastActivityOf(a) }))
+    .sort((a, b) => a.registered.localeCompare(b.registered))
     .map((a) => {
       const book = SVC_BOOK[a.serviceId] ?? "GEN";
       counters[book] = (counters[book] ?? 0) + 1;
-      const year = a.submitted.slice(0, 4);
+      const year = a.registered.slice(0, 4);
       return { ...a, regNo: `LAO/${book}/${year}/${String(counters[book]).padStart(5, "0")}` };
     })
     .reverse(); // newest first
@@ -42,39 +46,39 @@ const REGISTER = buildRegister();
 
 interface ServiceStat {
   id: string;
-  registered: number;
+  inRegister: number;
   issued: number;
-  revoked: number;
-  pending: number;
+  pendingIssue: number;
 }
 
+/* Only register states are counted, so every number has matching rows below. */
 function buildServiceStats(): Record<string, ServiceStat> {
   const out: Record<string, ServiceStat> = Object.fromEntries(
-    SERVICES.map((s) => [s.id, { id: s.id, registered: 0, issued: 0, revoked: 0, pending: 0 }]),
+    SERVICES.map((s) => [s.id, { id: s.id, inRegister: 0, issued: 0, pendingIssue: 0 }]),
   );
   for (const a of APPLICATIONS) {
     const s = out[a.serviceId];
-    if (!s) continue;
-    if (REGISTER_STATUSES.has(a.status)) s.registered += 1;
+    if (!s || !REGISTER_STATUSES.has(a.status)) continue;
+    s.inRegister += 1;
     if (a.status === "issued") s.issued += 1;
-    if (a.status === "revoked") s.revoked += 1;
-    if (PENDING_STATUSES.has(a.status)) s.pending += 1;
+    if (a.status === "registered") s.pendingIssue += 1;
   }
   return out;
 }
 
 const SERVICE_STATS = buildServiceStats();
 
-function exportCsv(rows: (Application & { regNo: string })[]) {
-  const header = ["Register No", "Registrant", "Service", "Province", "Event date", "Registrar", "Status"];
+function exportCsv(rows: RegisterEntry[]) {
+  const header = ["Register No", "Registrant", "Service", "Province", "Event date", "Registered", "Registrar", "Certificate"];
   const body = rows.map((r) => [
     r.regNo,
     r.applicant,
     SERVICE_BY_ID[r.serviceId]?.label ?? r.serviceId,
     r.province,
-    r.submitted,
+    eventDateOf(r),
+    r.registered,
     r.officer ?? "",
-    STATUS_META[r.status].label,
+    CERT_META[r.status]?.label ?? r.status,
   ]);
   const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
   const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
@@ -103,7 +107,8 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
     const q = query.trim().toLowerCase();
     return REGISTER.filter((r) => {
       if (service && r.serviceId !== service) return false;
-      if (!inRange(r.submitted, dateRange)) return false;
+      // A register is browsed by when entries were recorded, not filed.
+      if (!inRange(r.registered, dateRange)) return false;
       if (q && !`${r.regNo} ${r.id} ${r.applicant} ${r.province}`.toLowerCase().includes(q)) return false;
       return true;
     });
@@ -173,9 +178,9 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                   blue = on the register, green = issued, amber = still moving. */}
               <div className="grid grid-cols-3 gap-2 mt-4 pt-3 border-t border-gray-50">
                 {[
-                  { label: "In register", value: stat.registered, color: "#3752AE" },
+                  { label: "In register", value: stat.inRegister, color: "#3752AE" },
                   { label: "Issued", value: stat.issued, color: "#047857" },
-                  { label: "In progress", value: stat.pending, color: "#B45309" },
+                  { label: "Pending issue", value: stat.pendingIssue, color: "#B45309" },
                 ].map((k) => (
                   <div key={k.label}>
                     <p className="text-lg font-bold leading-tight" style={{ color: k.color }}>
@@ -248,9 +253,9 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                 <th className="px-4 py-3 font-medium">Service</th>
                 <th className="px-4 py-3 font-medium">Province</th>
                 <th className="px-4 py-3 font-medium">Event date</th>
+                <th className="px-4 py-3 font-medium">Registered</th>
                 <th className="px-4 py-3 font-medium">Registrar</th>
                 <th className="px-4 py-3 font-medium">Certificate</th>
-                <th className="px-4 py-3 font-medium">Status</th>
                 <th className="pl-4 pr-5 py-3 font-medium w-px whitespace-nowrap">Action</th>
               </tr>
             </thead>
@@ -277,7 +282,8 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                       </span>
                     </td>
                     <td className="px-4 py-3 text-gray-600">{r.province}</td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{r.submitted}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{eventDateOf(r)}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{r.registered}</td>
                     <td className="px-4 py-3 text-gray-500">{r.officer ?? "—"}</td>
                     <td className="px-4 py-3">
                       <span
@@ -287,9 +293,6 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                         <CertIcon className="w-3.5 h-3.5" />
                         {cert.label}
                       </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={r.status} />
                     </td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                       <button

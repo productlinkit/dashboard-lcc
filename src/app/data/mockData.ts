@@ -133,9 +133,33 @@ export interface Application {
   applicant: string;
   serviceId: string;
   province: string;
-  submitted: string; // YYYY-MM-DD
+  submitted: string; // YYYY-MM-DD — when the case was filed
+  eventDate?: string; // YYYY-MM-DD — when the underlying event occurred (birth/death/…)
+  updated?: string; // YYYY-MM-DD — last activity / entered current status
   status: AppStatus;
   officer?: string;
+}
+
+/* The event legally predates the filing (a birth is registered days after it
+ * happens); for address/household services the event is effective at filing. */
+export function eventDateOf(a: Application): string {
+  return a.eventDate ?? a.submitted;
+}
+
+/* Last time the case moved — its most recent status transition. Seed rows that
+ * predate the field fall back to their submission date. */
+export function lastActivityOf(a: Application): string {
+  return a.updated ?? a.submitted;
+}
+
+/** Whole days between two YYYY-MM-DD dates (b − a). */
+export function daysBetween(a: string, b: string): number {
+  return Math.round((new Date(`${b}T00:00:00`).getTime() - new Date(`${a}T00:00:00`).getTime()) / 86_400_000);
+}
+
+/** How many days ago (from today) a YYYY-MM-DD date was. */
+export function daysAgo(date: string): number {
+  return Math.max(0, Math.round((Date.now() - new Date(`${date}T00:00:00`).getTime()) / 86_400_000));
 }
 
 const SEED_APPLICATIONS: Application[] = [
@@ -211,6 +235,17 @@ const SVC_PREFIX: Record<string, string> = {
  * cover seven real days and none renders as a stub bar. */
 const GEN_WINDOW_DAYS = 119;
 
+/* How long before filing the event happened, by service. A birth is registered
+ * up to a few weeks late; an address change is effective at filing. */
+const EVENT_LEAD: Record<string, number> = {
+  birth: 25,
+  death: 8,
+  marriage: 18,
+  divorce: 40,
+  resident: 0,
+  "family-book": 0,
+};
+
 function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
@@ -218,23 +253,32 @@ function pad2(n: number): string {
 function generateApplications(count: number): Application[] {
   const out: Application[] = [];
   const base = new Date(); // rolling window ending today, so dates are never in the future
+  const iso = (back: number) => {
+    const d = new Date(base);
+    d.setDate(d.getDate() - back);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  };
+
   for (let i = 0; i < count; i++) {
     // Stride 47 is coprime with the window, so cases land evenly on every day of
     // it rather than bunching up — bunching is what produced revenue spikes.
-    const daysAgo = (i * 47) % GEN_WINDOW_DAYS;
+    const filedDaysAgo = (i * 47) % GEN_WINDOW_DAYS;
     const svc = SVC_POOL[(i * 5) % SVC_POOL.length];
     const id = `${SVC_PREFIX[svc]}-2026-${String(3100 + i).padStart(6, "0")}`;
     // A case is closed once its own processing time has elapsed — not at a fixed
     // cut-off. Otherwise no recent case would ever be finished and the completed
     // series would collapse to zero at the right-hand edge of every chart.
     const target = SERVICE_BY_ID[svc]?.slaDays ?? 7;
-    const pool = daysAgo >= Math.ceil(processingDaysFor(id, svc, target))
-      ? CLOSED_STATUS_POOL
-      : OPEN_STATUS_POOL;
+    const proc = Math.ceil(processingDaysFor(id, svc, target));
+    const closed = filedDaysAgo >= proc;
+    const pool = closed ? CLOSED_STATUS_POOL : OPEN_STATUS_POOL;
     const status = pool[(i * 7) % pool.length];
-    const d = new Date(base);
-    d.setDate(d.getDate() - daysAgo);
-    const submitted = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+    // Event predates filing; last activity is the close date (closed) or a recent
+    // stage transition (open) — never before the case was filed.
+    const lead = EVENT_LEAD[svc] ? (i * 17) % (EVENT_LEAD[svc] + 1) : 0;
+    const updatedDaysAgo = closed ? Math.max(0, filedDaysAgo - proc) : Math.min(filedDaysAgo, (i * 13) % 10);
+
     const hasOfficer = !(status === "draft" || status === "submitted");
     out.push({
       id,
@@ -243,7 +287,9 @@ function generateApplications(count: number): Application[] {
       }`,
       serviceId: svc,
       province: GEN_PROVINCES[(i * 5) % GEN_PROVINCES.length],
-      submitted,
+      submitted: iso(filedDaysAgo),
+      eventDate: iso(filedDaysAgo + lead),
+      updated: iso(updatedDaysAgo),
       status,
       officer: hasOfficer ? GEN_OFFICERS[(i * 3) % GEN_OFFICERS.length] : undefined,
     });

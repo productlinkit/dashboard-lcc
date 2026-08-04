@@ -6,9 +6,11 @@
  * consistent. Deterministic: same output on every load.
  */
 import { PROVINCE_STATS } from "./mockData";
+import { hashStr } from "./derive";
 
 export type Gender = "male" | "female";
 export type CitizenStatus = "active" | "deceased" | "moved";
+export type Nationality = "Lao" | "Foreign";
 
 export interface Citizen {
   uin: string; // Unique Identification Number
@@ -22,6 +24,7 @@ export interface Citizen {
   village: string;
   householdNo: string;
   status: CitizenStatus;
+  nationality: Nationality;
 }
 
 export interface Household {
@@ -118,6 +121,8 @@ function buildHouseholds(count: number): Household[] {
     const headGender: Gender = rnd() < 0.68 ? "male" : "female";
     const headAge = 28 + Math.floor(rnd() * 42); // 28–69
     const composition = COMPOSITIONS[Math.floor(rnd() * COMPOSITIONS.length)];
+    // Foreign residents are registered as whole households, and are rare (~2%).
+    const nationality: Nationality = rnd() < 0.02 ? "Foreign" : "Lao";
 
     const regDaysAgo = Math.floor(rnd() * 2200); // registered over the last ~6 years
     const regDate = new Date(TODAY);
@@ -145,6 +150,7 @@ function buildHouseholds(count: number): Household[] {
         village,
         householdNo: no,
         status,
+        nationality,
       });
     };
 
@@ -169,7 +175,102 @@ export const HOUSEHOLD_BY_NO: Record<string, Household> = Object.fromEntries(
   HOUSEHOLDS.map((h) => [h.no, h]),
 );
 
+/* Working age follows the standard 15–64 band; everyone else is a dependent. */
+export const WORKING_AGE = { from: 15, to: 64 };
+const isWorkingAge = (c: Citizen) => c.age >= WORKING_AGE.from && c.age <= WORKING_AGE.to;
+
+/* ── Registered-population demographic trend (last 12 months) ──
+ * Deterministic monthly flows; the population line is back-computed to end at
+ * today's registered total, so births − deaths + in − out reconciles with it. */
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+export interface DemoMonth {
+  month: string;
+  births: number;
+  deaths: number;
+  movedIn: number;
+  movedOut: number;
+  population: number;
+}
+
+function buildDemographicTrend(): DemoMonth[] {
+  const rnd = mulberry32(20260804);
+  const flows = Array.from({ length: 12 }, () => ({
+    births: 20 + Math.floor(rnd() * 14), // 20–33
+    deaths: 10 + Math.floor(rnd() * 8), // 10–17
+    movedIn: 8 + Math.floor(rnd() * 8), // 8–15
+    movedOut: 6 + Math.floor(rnd() * 7), // 6–11
+  }));
+
+  // Latest month ends at the current registered total; walk backwards.
+  const pop = new Array<number>(12);
+  pop[11] = CITIZENS.length;
+  for (let m = 10; m >= 0; m--) {
+    const f = flows[m + 1];
+    pop[m] = pop[m + 1] - (f.births - f.deaths + f.movedIn - f.movedOut);
+  }
+
+  return flows.map((f, m) => {
+    const d = new Date(THIS_YEAR, TODAY.getMonth() - (11 - m), 1);
+    return {
+      month: `${MONTH_ABBR[d.getMonth()]} '${String(d.getFullYear()).slice(2)}`,
+      ...f,
+      population: pop[m],
+    };
+  });
+}
+
+export const DEMOGRAPHIC_TREND: DemoMonth[] = buildDemographicTrend();
+
+const sum = (key: keyof DemoMonth) => DEMOGRAPHIC_TREND.reduce((a, m) => a + (m[key] as number), 0);
+const popStart = DEMOGRAPHIC_TREND[0].population;
+const popEnd = DEMOGRAPHIC_TREND[DEMOGRAPHIC_TREND.length - 1].population;
+
+/* ── Per-region comparison ── */
+export interface RegionStat {
+  province: string;
+  population: number;
+  households: number;
+  male: number;
+  female: number;
+  foreign: number;
+  workingAge: number;
+  growthPct: number;
+}
+
+function buildRegionStats(): RegionStat[] {
+  const hhByProvince: Record<string, number> = {};
+  for (const h of HOUSEHOLDS) hhByProvince[h.province] = (hhByProvince[h.province] ?? 0) + 1;
+
+  const byProvince: Record<string, RegionStat> = {};
+  for (const c of CITIZENS) {
+    const r = (byProvince[c.province] ??= {
+      province: c.province,
+      population: 0,
+      households: hhByProvince[c.province] ?? 0,
+      male: 0,
+      female: 0,
+      foreign: 0,
+      workingAge: 0,
+      // Deterministic annual growth per province, −1.5% … +5.0%.
+      growthPct: +(((hashStr(c.province) % 65) - 15) / 10).toFixed(1),
+    });
+    r.population += 1;
+    if (c.gender === "male") r.male += 1;
+    else r.female += 1;
+    if (c.nationality === "Foreign") r.foreign += 1;
+    if (isWorkingAge(c)) r.workingAge += 1;
+  }
+  return Object.values(byProvince).sort((a, b) => b.population - a.population);
+}
+
+export const REGION_STATS: RegionStat[] = buildRegionStats();
+
 /* ── Aggregates used by the page header ── */
+const workingAge = CITIZENS.filter(isWorkingAge).length;
+const dependents = CITIZENS.length - workingAge;
+const foreign = CITIZENS.filter((c) => c.nationality === "Foreign").length;
+
 export const POPULATION_SUMMARY = {
   citizens: CITIZENS.length,
   households: HOUSEHOLDS.length,
@@ -181,6 +282,20 @@ export const POPULATION_SUMMARY = {
   moved: CITIZENS.filter((c) => c.status === "moved").length,
   minors: CITIZENS.filter((c) => c.age < 18).length,
   seniors: CITIZENS.filter((c) => c.age >= 60).length,
+  workingAge,
+  dependents,
+  dependencyRatio: workingAge ? Math.round((dependents / workingAge) * 100) : 0,
+  foreign,
+  local: CITIZENS.length - foreign,
+  // Vital & migration over the last 12 months
+  births: sum("births"),
+  deaths: sum("deaths"),
+  movedIn: sum("movedIn"),
+  movedOut: sum("movedOut"),
+  netMigration: sum("movedIn") - sum("movedOut"),
+  naturalIncrease: sum("births") - sum("deaths"),
+  growthAbs: popEnd - popStart,
+  growthPct: popStart ? +(((popEnd - popStart) / popStart) * 100).toFixed(1) : 0,
 };
 
 export const AGE_BANDS = [
@@ -200,3 +315,93 @@ export function ageDistribution(citizens: Citizen[]) {
 }
 
 export const PROVINCE_NAMES = Object.keys(PROVINCE_STATS);
+
+/* ── Location drill-down (Country → Province → District → Village) ──
+ * Every citizen and household carries province/district/village, so any level
+ * is just a filter. This powers the GIS map's location explorer. */
+export type AreaLevel = "country" | "province" | "district" | "village";
+
+export interface AreaChild {
+  name: string;
+  population: number;
+  households: number;
+}
+
+export interface AreaStat {
+  level: AreaLevel;
+  name: string;
+  path: { province?: string; district?: string; village?: string };
+  population: number;
+  households: number;
+  male: number;
+  female: number;
+  workingAge: number;
+  minors: number;
+  seniors: number;
+  foreign: number;
+  ageBands: { band: string; male: number; female: number }[];
+  childLabel: string; // what the children are ("Provinces", "Districts"…)
+  children: AreaChild[];
+}
+
+export function areaStat(province?: string | null, district?: string | null, village?: string | null): AreaStat {
+  const cz = CITIZENS.filter(
+    (c) =>
+      (!province || c.province === province) &&
+      (!district || c.district === district) &&
+      (!village || c.village === village),
+  );
+  const hh = HOUSEHOLDS.filter(
+    (h) =>
+      (!province || h.province === province) &&
+      (!district || h.district === district) &&
+      (!village || h.village === village),
+  );
+
+  const level: AreaLevel = village ? "village" : district ? "district" : province ? "province" : "country";
+  const name = village || district || province || "Lao PDR";
+
+  // Children are the next level down, with their own population & household count.
+  let childLabel = "";
+  const groups: Record<string, { population: number; households: Set<string> }> = {};
+  const keyFor = (c: Citizen): string | null => {
+    if (level === "country") return c.province;
+    if (level === "province") return c.district;
+    if (level === "district") return c.village;
+    return null;
+  };
+  if (level !== "village") {
+    childLabel = level === "country" ? "Provinces" : level === "province" ? "Districts" : "Villages";
+    for (const c of cz) {
+      const k = keyFor(c);
+      if (!k) continue;
+      (groups[k] ??= { population: 0, households: new Set() }).population += 1;
+      groups[k].households.add(c.householdNo);
+    }
+  }
+  const children: AreaChild[] = Object.entries(groups)
+    .map(([n, g]) => ({ name: n, population: g.population, households: g.households.size }))
+    .sort((a, b) => b.population - a.population);
+
+  return {
+    level,
+    name,
+    path: { province: province ?? undefined, district: district ?? undefined, village: village ?? undefined },
+    population: cz.length,
+    households: hh.length,
+    male: cz.filter((c) => c.gender === "male").length,
+    female: cz.filter((c) => c.gender === "female").length,
+    workingAge: cz.filter(isWorkingAge).length,
+    minors: cz.filter((c) => c.age < 18).length,
+    seniors: cz.filter((c) => c.age >= 60).length,
+    foreign: cz.filter((c) => c.nationality === "Foreign").length,
+    ageBands: ageDistribution(cz),
+    childLabel,
+    children,
+  };
+}
+
+/* Population per province — the map's default colour metric. */
+export const POPULATION_BY_PROVINCE: Record<string, number> = Object.fromEntries(
+  REGION_STATS.map((r) => [r.province, r.population]),
+);

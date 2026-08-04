@@ -1,152 +1,190 @@
 import { useMemo, useState } from "react";
 import {
-  Download, FileText, Wallet, AlertTriangle, Percent, FileCheck2, RotateCcw, Ban, ScanLine, Timer,
+  Download, FileText, FileCheck2, Wallet, Percent, Timer, ArrowUpRight, ArrowDownRight,
+  Users, Globe, Scale, AlertTriangle,
 } from "lucide-react";
 import {
-  ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, PieChart, Pie,
+  ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Cell, PieChart, Pie,
 } from "recharts";
 import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
-import { calendarBuckets, hashStr } from "../data/derive";
+import { calendarBuckets } from "../data/derive";
 import { APPLICATIONS } from "../data/mockData";
-import { serviceStatsFor, overallTurnaround, processingDays, CLOSED_STATUSES } from "../data/serviceStats";
+import { serviceStatsFor, overallTurnaround, previousRange, completionDate } from "../data/serviceStats";
 import { TRANSACTIONS, DEFAULT_METHODS, METHOD_COLOR } from "../data/payments";
-import { SERVICES, SERVICE_BY_ID, formatLak } from "../serviceConfig";
+import { SERVICE_BY_ID, formatLak } from "../serviceConfig";
+import { POPULATION_SUMMARY, DEMOGRAPHIC_TREND, areaStat } from "../data/population";
+import { LocationFilter, NO_LOCATION, type LocationValue } from "../components/LocationFilter";
 
 /*
- * Reports read the SAME rows the rest of the app does — APPLICATIONS and
- * TRANSACTIONS — rather than generating their own figures. Anything shown here
- * can be reconciled against Applications, Approval Queue and Payments.
+ * Reports & Analytics — turns the registry's raw records into insight: trends,
+ * rates, period-on-period change and regional comparison. Structured as the
+ * ministry reads it: Certificate volume → Financial → Population analytics.
+ *
+ * Raw census/case rows live in their own modules (Population, Applications);
+ * this page only aggregates and compares them.
  */
-const REJECT_REASONS = [
-  "Missing document",
-  "Mismatched ID / eID",
-  "Incomplete address",
-  "Ineligible / not qualified",
-  "Duplicate record",
-  "Illegible attachment",
-];
 
-function buildReport(range: DateRange) {
-  const apps = APPLICATIONS.filter((a) => inRange(a.submitted, range));
-  const tx = TRANSACTIONS.filter((t) => inRange(t.date, range));
-  const services = serviceStatsFor(range);
-  const turnaround = overallTurnaround(range);
+function pctChange(now: number, prev: number): number {
+  if (prev === 0) return now === 0 ? 0 : 100;
+  return ((now - prev) / prev) * 100;
+}
 
-  const collected = services.reduce((a, s) => a + s.collected, 0);
-  const outstanding = services.reduce((a, s) => a + s.outstanding, 0);
+/* ── Report model ──
+ * `province` scopes case & financial figures. Case and receipt records only carry
+ * a province, so district/village can't refine them — the page notes this. */
+function buildReport(range: DateRange, province: string | null) {
+  const inProv = (p: string) => !province || p === province;
+  const apps = APPLICATIONS.filter((a) => inRange(a.submitted, range) && inProv(a.province));
+  const tx = TRANSACTIONS.filter((t) => inRange(t.date, range) && inProv(t.province));
+  const services = serviceStatsFor(range, province);
+  const turnaround = overallTurnaround(range, province);
+
+  const prevRange = previousRange(range);
+  const prevApps = APPLICATIONS.filter((a) => inRange(a.submitted, prevRange) && inProv(a.province));
+  const prevTx = TRANSACTIONS.filter((t) => inRange(t.date, prevRange) && inProv(t.province));
+  const prevServices = serviceStatsFor(prevRange, province);
+  const prevTurn = overallTurnaround(prevRange, province);
+
+  // ── Certificate volume ──
+  const received = apps.length;
+  const prevReceived = prevApps.length;
+  const issued = services.reduce((a, s) => a + s.issued, 0);
+  const prevIssued = prevServices.reduce((a, s) => a + s.issued, 0);
+  const inRegister = apps.filter((a) => ["registered", "issued", "revoked"].includes(a.status)).length;
+  const issuanceRate = received ? (issued / received) * 100 : 0;
+  const prevIssuanceRate = prevReceived ? (prevIssued / prevReceived) * 100 : 0;
+
+  // ── Financial ──
+  const paidTx = tx.filter((t) => t.status === "paid");
+  const collected = paidTx.reduce((s, t) => s + t.amount, 0);
+  const prevCollected = prevTx.filter((t) => t.status === "paid").reduce((s, t) => s + t.amount, 0);
+  const outstanding = tx.filter((t) => t.status === "pending").reduce((s, t) => s + t.amount, 0);
   const billed = collected + outstanding;
-  const collectionRate = billed ? Math.round((collected / billed) * 100) : 0;
+  const collectionRate = billed ? (collected / billed) * 100 : 0;
+  const prevBilled = prevCollected + prevTx.filter((t) => t.status === "pending").reduce((s, t) => s + t.amount, 0);
+  const prevCollectionRate = prevBilled ? (prevCollected / prevBilled) * 100 : 0;
+  const avgReceipt = paidTx.length ? collected / paidTx.length : 0;
   const unpaidCases = services.reduce((a, s) => a + s.unpaid, 0);
 
-  /* Time series — buckets follow the calendar span, days without data show zero. */
-  const allDates = [...apps.map((a) => a.submitted), ...tx.map((t) => t.date)].sort();
-  const { buckets, granularity } = calendarBuckets(range, {
-    from: allDates[0] ?? "",
-    to: allDates[allDates.length - 1] ?? "",
-  });
+  // ── Time series (received & issued by period; collected & outstanding) ──
+  const dates = [...apps.map((a) => a.submitted), ...tx.map((t) => t.date)].sort();
+  const { buckets, granularity } = calendarBuckets(range, { from: dates[0] ?? "", to: dates[dates.length - 1] ?? "" });
+  const receivedByDay: Record<string, number> = {};
+  for (const a of apps) receivedByDay[a.submitted] = (receivedByDay[a.submitted] ?? 0) + 1;
+  const issuedByDay: Record<string, number> = {};
+  for (const a of APPLICATIONS) {
+    if (a.status !== "issued") continue;
+    const d = completionDate(a);
+    if (d) issuedByDay[d] = (issuedByDay[d] ?? 0) + 1;
+  }
   const collectedByDay: Record<string, number> = {};
   const outstandingByDay: Record<string, number> = {};
   for (const t of tx) {
     if (t.status === "paid") collectedByDay[t.date] = (collectedByDay[t.date] ?? 0) + t.amount;
     if (t.status === "pending") outstandingByDay[t.date] = (outstandingByDay[t.date] ?? 0) + t.amount;
   }
-  const requestsByDay: Record<string, number> = {};
-  for (const a of apps) requestsByDay[a.submitted] = (requestsByDay[a.submitted] ?? 0) + 1;
-
   const series = buckets.map((b) => ({
     day: b.label,
+    received: b.days.reduce((s, d) => s + (receivedByDay[d] ?? 0), 0),
+    issued: b.days.reduce((s, d) => s + (issuedByDay[d] ?? 0), 0),
     collected: b.days.reduce((s, d) => s + (collectedByDay[d] ?? 0), 0),
     outstanding: b.days.reduce((s, d) => s + (outstandingByDay[d] ?? 0), 0),
-    requests: b.days.reduce((s, d) => s + (requestsByDay[d] ?? 0), 0),
   }));
 
   const payMethods = DEFAULT_METHODS.map((m) => ({
     id: m.id,
     name: m.label,
-    value: tx.filter((t) => t.status === "paid" && t.method === m.id).reduce((s, t) => s + t.amount, 0),
+    value: paidTx.filter((t) => t.method === m.id).reduce((s, t) => s + t.amount, 0),
     color: METHOD_COLOR[m.id],
   })).filter((m) => m.value > 0);
 
-  const provinceCounts: Record<string, number> = {};
-  for (const a of apps) provinceCounts[a.province] = (provinceCounts[a.province] ?? 0) + 1;
-  const provinces = Object.entries(provinceCounts)
-    .map(([name, value]) => ({ name, value }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 8);
-
-  const returns = apps.filter((a) => a.status === "returned").length;
-  const rejected = apps.filter((a) => a.status === "rejected").length;
-  const reasonTotal = returns + rejected;
-  const weights = REJECT_REASONS.map((reason, i) => ({ reason, w: 10 + ((hashStr(reason) >> i) % 22) }));
-  const wSum = weights.reduce((a, r) => a + r.w, 0);
-  const reasonRows = weights
-    .map((r) => ({ reason: r.reason, count: Math.round((reasonTotal * r.w) / wSum) }))
-    .sort((a, b) => b.count - a.count);
-
-  const issuedCount = apps.filter((a) => a.status === "issued").length;
-  const certs = {
-    issued: issuedCount,
-    reissued: tx.filter((t) => t.kind === "certified-copy").length,
-    revoked: apps.filter((a) => a.status === "revoked").length,
-    qrScans: Math.round(issuedCount * 2.4),
-  };
-
-  const countOf = (id: string) => services.find((s) => s.id === id)?.volume ?? 0;
-  const familyBook = {
-    added: countOf("birth"),
-    removed: countOf("death"),
-    statusUpdates: countOf("marriage") + countOf("divorce") + Math.round(countOf("resident") * 0.3),
-  };
-
-  const byOfficer: Record<string, { processed: number; issued: number; days: number[] }> = {};
-  for (const a of apps) {
-    if (!a.officer) continue;
-    const o = (byOfficer[a.officer] ??= { processed: 0, issued: 0, days: [] });
-    o.processed += 1;
-    if (a.status === "issued") o.issued += 1;
-    if (CLOSED_STATUSES.includes(a.status)) o.days.push(processingDays(a, SERVICE_BY_ID[a.serviceId]?.slaDays ?? 7));
-  }
-  const officers = Object.entries(byOfficer)
-    .map(([name, o]) => ({
-      name,
-      processed: o.processed,
-      issued: o.issued,
-      avgDays: o.days.length ? +(o.days.reduce((s, d) => s + d, 0) / o.days.length).toFixed(1) : 0,
-    }))
-    .sort((a, b) => b.processed - a.processed);
-
+  // ── Certificate volume by service, with share & delta ──
+  const serviceRows = services
+    .map((s) => {
+      const prev = prevServices.find((p) => p.id === s.id);
+      return {
+        ...s,
+        share: issued ? (s.issued / issued) * 100 : 0,
+        issuedDelta: pctChange(s.issued, prev?.issued ?? 0),
+      };
+    })
+    .sort((a, b) => b.issued - a.issued);
 
   return {
-    total: apps.length,
-    services,
-    collected,
-    outstanding,
-    billed,
-    collectionRate,
-    unpaidCases,
-    series,
     granularity,
-    payMethods,
-    provinces,
-    returns,
-    rejected,
-    reasonRows,
-    certs,
-    familyBook,
-    officers,
-    issuedCount,
-    avgDays: turnaround.avgDays,
+    // Deltas need a real prior window; "all time" has none.
+    comparable: !!(range.from || range.to),
+    // certificate volume
+    received, receivedDelta: pctChange(received, prevReceived),
+    issued, issuedDelta: pctChange(issued, prevIssued),
+    inRegister,
+    issuanceRate, issuanceRateDelta: issuanceRate - prevIssuanceRate,
+    avgDays: turnaround.avgDays, avgDaysDelta: pctChange(turnaround.avgDays, prevTurn.avgDays),
     slaOverall: turnaround.sla,
+    serviceRows,
+    // financial
+    collected, collectedDelta: pctChange(collected, prevCollected),
+    outstanding, unpaidCases,
+    collectionRate, collectionRateDelta: collectionRate - prevCollectionRate,
+    avgReceipt,
+    billed,
+    payMethods,
+    series,
   };
 }
 
 type Report = ReturnType<typeof buildReport>;
 
+/* ── Population analytics — scoped to the selected area via areaStat ──
+ * Structure (sex ratio, working-age, distribution) is area-specific; the 12-month
+ * demographic trend is national and labelled as such. */
+function buildDemographics(location: LocationValue) {
+  const s = POPULATION_SUMMARY;
+  const area = areaStat(location.province, location.district, location.village);
+
+  // Per-child breakdown, each aggregated the same way.
+  const childRows = area.children.map((c) => {
+    const sub = areaStat(
+      area.level === "country" ? c.name : area.path.province,
+      area.level === "province" ? c.name : area.path.district,
+      area.level === "district" ? c.name : area.path.village,
+    );
+    return {
+      name: c.name,
+      population: sub.population,
+      households: sub.households,
+      share: area.population ? (sub.population / area.population) * 100 : 0,
+      sexRatio: sub.female ? Math.round((sub.male / sub.female) * 100) : 0,
+      workingPct: sub.population ? Math.round((sub.workingAge / sub.population) * 100) : 0,
+    };
+  });
+
+  const change = DEMOGRAPHIC_TREND.map((m) => ({
+    month: m.month,
+    natural: m.births - m.deaths,
+    migration: m.movedIn - m.movedOut,
+    population: m.population,
+  }));
+
+  return {
+    s,
+    area,
+    sexRatio: area.female ? Math.round((area.male / area.female) * 100) : 0,
+    workingPct: area.population ? Math.round((area.workingAge / area.population) * 100) : 0,
+    foreignPct: area.population ? (area.foreign / area.population) * 100 : 0,
+    childRows,
+    change,
+    concentration: childRows[0]?.share ?? 0,
+    topChild: childRows[0]?.name ?? "",
+    maxShare: childRows[0]?.share ?? 1,
+  };
+}
+
 function csvExport(r: Report) {
-  const header = ["Service", "Applications", "Issued", "Receipts paid", "Unpaid", "Collected (LAK)", "Outstanding (LAK)", "Target days", "Avg days", "Within target %", "Overdue"];
-  const body = r.services.map((s) => [
+  const header = ["Service", "Issued", "Share %", "Issued Δ%", "Closed", "Avg days", "Within target %", "Collected (LAK)", "Outstanding (LAK)"];
+  const body = r.serviceRows.map((s) => [
     SERVICE_BY_ID[s.id]?.label ?? s.id,
-    s.volume, s.issued, s.receipts, s.unpaid, s.collected, s.outstanding, s.target, s.avgDays, s.sla, s.overdue,
+    s.issued, s.share.toFixed(1), s.issuedDelta.toFixed(1), s.closed, s.avgDays, s.sla, s.collected, s.outstanding,
   ]);
   const esc = (v: string | number) => `"${String(v).replace(/"/g, '""')}"`;
   const csv = [header, ...body].map((row) => row.map(esc).join(",")).join("\n");
@@ -158,21 +196,36 @@ function csvExport(r: Report) {
   URL.revokeObjectURL(url);
 }
 
-/* ── Small presentational helpers ── */
+/* ── Presentational helpers ── */
+function Delta({ value, invert = false, unit = "%" }: { value: number; invert?: boolean; unit?: string }) {
+  const flat = Math.abs(value) < 0.05;
+  const down = value < 0;
+  const good = invert ? down : !down;
+  const Icon = down ? ArrowDownRight : ArrowUpRight;
+  if (flat) return <span className="text-[11px] font-medium text-gray-400">no change</span>;
+  return (
+    <span className={`inline-flex items-center gap-0.5 text-[11px] font-semibold ${good ? "text-emerald-600" : "text-red-500"}`}>
+      <Icon className="w-3 h-3" />
+      {value >= 0 ? "+" : ""}{value.toFixed(1)}{unit}
+    </span>
+  );
+}
+
 function Kpi({
-  icon: Icon, label, value, sub, tint,
+  icon: Icon, label, value, sub, tint, delta,
 }: {
-  icon: typeof Wallet; label: string; value: string; sub?: string; tint: string;
+  icon: typeof Wallet; label: string; value: string; sub?: string; tint: string; delta?: React.ReactNode;
 }) {
   return (
     <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center justify-between gap-2">
         <span className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ backgroundColor: `${tint}1A` }}>
           <Icon className="w-5 h-5" style={{ color: tint } as React.CSSProperties} />
         </span>
-        <p className="text-sm text-gray-500">{label}</p>
+        {delta}
       </div>
       <p className="text-2xl font-bold text-gray-800 mt-3">{value}</p>
+      <p className="text-sm text-gray-500">{label}</p>
       {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
     </div>
   );
@@ -181,7 +234,7 @@ function Kpi({
 function SectionTitle({ children, sub }: { children: React.ReactNode; sub?: string }) {
   return (
     <div className="pt-2">
-      <h2 className="text-lg font-bold text-gray-800">{children}</h2>
+      <h2 className="text-lg font-bold text-gray-800 leading-tight">{children}</h2>
       {sub && <p className="text-sm text-gray-400">{sub}</p>}
     </div>
   );
@@ -197,22 +250,35 @@ function Card({ title, sub, children, className = "" }: { title: string; sub?: s
   );
 }
 
+function ServiceCell({ id }: { id: string }) {
+  const svc = SERVICE_BY_ID[id];
+  return (
+    <span className="inline-flex items-center gap-2 text-gray-700 whitespace-nowrap">
+      <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
+      {svc?.short ?? id}
+    </span>
+  );
+}
+
 const tooltipStyle = { borderRadius: 12, border: "1px solid #EEF0F4", fontSize: 12 };
 const lakShort = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}K` : String(n));
 
 export function ReportsPage() {
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
-  const r = useMemo(() => buildReport(dateRange), [dateRange]);
-  const perLabel = r.granularity === "day" ? "day" : r.granularity === "week" ? "week" : "month";
+  const [location, setLocation] = useState<LocationValue>(NO_LOCATION);
+  const r = useMemo(() => buildReport(dateRange, location.province), [dateRange, location.province]);
+  const d = useMemo(() => buildDemographics(location), [location]);
+  const per = r.granularity === "day" ? "day" : r.granularity === "week" ? "week" : "month";
+  const deeperThanProvince = !!(location.district || location.village);
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-5 pb-10">
       {/* Header */}
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-xl font-bold text-gray-800">Reports</h1>
+          <h1 className="text-xl font-bold text-gray-800">Reports &amp; Analytics</h1>
           <p className="text-sm text-gray-400 mt-0.5">
-            Built from the same case and receipt records as the rest of the console.
+            Trends, rates and regional comparison — deltas are versus the previous period of equal length.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -226,24 +292,66 @@ export function ReportsPage() {
         </div>
       </div>
 
-      {/* Headline — the four numbers the whole report expands on */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Kpi icon={FileText} label="Applications" value={r.total.toLocaleString()} sub="Received in this period" tint="#3752AE" />
-        <Kpi icon={FileCheck2} label="Certificates issued" value={r.issuedCount.toLocaleString()} sub={`${r.total ? Math.round((r.issuedCount / r.total) * 100) : 0}% of applications`} tint="#10B981" />
-        <Kpi icon={Wallet} label="Fees collected" value={formatLak(r.collected)} sub={`${r.collectionRate}% of ${formatLak(r.billed)} billed`} tint="#047857" />
-        <Kpi icon={Timer} label="Avg. processing" value={`${r.avgDays} days`} sub="Submission to decision" tint="#6D28D9" />
+      {/* Location filter — scopes the whole report */}
+      <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
+        <LocationFilter value={location} onChange={setLocation} />
+        {deeperThanProvince && (
+          <p className="text-xs text-gray-400 mt-2">
+            Certificate and financial figures are tracked at province level, so they reflect{" "}
+            <span className="font-medium text-gray-600">{location.province}</span>. Population analytics below use the
+            selected {location.village ? "village" : "district"}.
+          </p>
+        )}
       </div>
 
-      {/* ── 1. Financial ── */}
-      <SectionTitle sub="Collections, outstanding fees and how citizens pay">Financial &amp; payments</SectionTitle>
+      {/* ═══ 1. Certificate volume ═══ */}
+      <SectionTitle sub="Registration and issuance output over time">Certificate volume</SectionTitle>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Kpi icon={Wallet} label="Collected" value={formatLak(r.collected)} tint="#10B981" />
-        <Kpi icon={AlertTriangle} label="Outstanding" value={formatLak(r.outstanding)} sub={`${r.unpaidCases} unpaid receipts`} tint="#F59E0B" />
-        <Kpi icon={Percent} label="Collection rate" value={`${r.collectionRate}%`} tint="#0EA5E9" />
-        <Kpi icon={FileText} label="Avg. per receipt" value={formatLak(r.certs.issued ? Math.round(r.collected / Math.max(1, r.services.reduce((a, s) => a + s.receipts, 0))) : 0)} tint="#3752AE" />
+        <Kpi icon={FileText} label="Applications received" value={r.received.toLocaleString()} tint="#3752AE" delta={r.comparable && <Delta value={r.receivedDelta} />} />
+        <Kpi icon={FileCheck2} label="Certificates issued" value={r.issued.toLocaleString()} tint="#10B981" delta={r.comparable && <Delta value={r.issuedDelta} />} />
+        <Kpi icon={Percent} label="Issuance rate" value={`${r.issuanceRate.toFixed(1)}%`} sub="issued ÷ received" tint="#0EA5E9" delta={r.comparable && <Delta value={r.issuanceRateDelta} unit=" pp" />} />
+        <Kpi icon={Timer} label="Avg. processing" value={`${r.avgDays} days`} sub={`${r.slaOverall}% within target`} tint="#6D28D9" delta={r.comparable && <Delta value={r.avgDaysDelta} invert />} />
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card title={`Revenue per ${perLabel}`} sub="Collected vs still outstanding" className="lg:col-span-2">
+        <Card title={`Received vs issued per ${per}`} sub="Throughput trend" className="lg:col-span-2">
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={r.series} margin={{ left: 4, right: 8, top: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
+              <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} interval="preserveStartEnd" />
+              <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} width={36} />
+              <Tooltip contentStyle={tooltipStyle} />
+              <Line type="monotone" dataKey="received" name="Received" stroke="#3752AE" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="issued" name="Issued" stroke="#10B981" strokeWidth={2} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+          <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
+            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#3752AE]" /> Received</span>
+            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /> Issued</span>
+          </div>
+        </Card>
+        <Card title="Issued by service" sub="Share of certificates issued">
+          <ReportTable
+            head={["Service", "Issued", "Share", "Δ"]}
+            rows={r.serviceRows.map((s) => [
+              <ServiceCell key="s" id={s.id} />,
+              s.issued.toLocaleString(),
+              `${s.share.toFixed(0)}%`,
+              r.comparable ? <Delta key="d" value={s.issuedDelta} /> : <span key="d" className="text-gray-300">—</span>,
+            ])}
+          />
+        </Card>
+      </div>
+
+      {/* ═══ 2. Financial report ═══ */}
+      <SectionTitle sub="Fee collection, outstanding balances and payment mix">Financial report</SectionTitle>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Kpi icon={Wallet} label="Collected" value={formatLak(r.collected)} tint="#10B981" delta={r.comparable && <Delta value={r.collectedDelta} />} />
+        <Kpi icon={Percent} label="Collection rate" value={`${r.collectionRate.toFixed(1)}%`} sub={`of ${formatLak(r.billed)} billed`} tint="#0EA5E9" delta={r.comparable && <Delta value={r.collectionRateDelta} unit=" pp" />} />
+        <Kpi icon={AlertTriangle} label="Outstanding" value={formatLak(r.outstanding)} sub={`${r.unpaidCases} unpaid receipts`} tint="#F59E0B" />
+        <Kpi icon={FileText} label="Avg. per receipt" value={formatLak(r.avgReceipt)} tint="#3752AE" />
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card title={`Revenue per ${per}`} sub="Collected vs still outstanding" className="lg:col-span-2">
           <ResponsiveContainer width="100%" height={240}>
             <BarChart data={r.series} margin={{ left: 4, right: 8, top: 8 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
@@ -276,182 +384,99 @@ export function ReportsPage() {
                 <span className="flex items-center gap-1.5 text-gray-500 truncate">
                   <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: p.color }} /> {p.name}
                 </span>
-                <span className="text-gray-700 font-medium">
-                  {r.collected ? Math.round((p.value / r.collected) * 100) : 0}%
-                </span>
+                <span className="text-gray-700 font-medium">{r.collected ? Math.round((p.value / r.collected) * 100) : 0}%</span>
               </div>
             ))}
           </div>
         </Card>
       </div>
-      <Card title="Revenue by service" sub="Receipts raised against each service in this period">
+      <Card title="Revenue by service" sub="Collected against each service this period">
         <ReportTable
-          head={["Service", "Apps", "Paid", "Unpaid", "Collected", "Outstanding"]}
-          rows={r.services.map((s) => [
+          head={["Service", "Collected", "Outstanding", "Paid receipts", "Unpaid"]}
+          rows={r.serviceRows.map((s) => [
             <ServiceCell key="s" id={s.id} />,
-            s.volume.toLocaleString(),
-            s.receipts ? s.receipts.toLocaleString() : "—",
-            s.unpaid ? s.unpaid.toLocaleString() : "—",
             s.collected ? formatLak(s.collected) : SERVICE_BY_ID[s.id]?.fee === 0 ? "Free" : "—",
             s.outstanding ? formatLak(s.outstanding) : "—",
+            s.receipts ? s.receipts.toLocaleString() : "—",
+            s.unpaid ? s.unpaid.toLocaleString() : "—",
           ])}
         />
       </Card>
 
-      {/* ── 2. Volume & vital statistics ── */}
-      <SectionTitle sub="Submissions, vital events and where they come from">Volume &amp; vital statistics</SectionTitle>
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        {r.services.map((s) => {
-          const svc = SERVICE_BY_ID[s.id];
-          return (
-            <div key={s.id} className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: svc?.color }} />
-                <p className="text-xs text-gray-500 truncate">{svc?.short}</p>
-              </div>
-              <p className="text-xl font-bold text-gray-800 mt-1.5">{s.volume.toLocaleString()}</p>
-              <p className="text-[11px] text-gray-400">{s.issued.toLocaleString()} issued</p>
-            </div>
-          );
-        })}
+      {/* ═══ 3. Population & demographic analytics ═══ */}
+      <SectionTitle sub={`Structure and distribution — ${d.area.name}`}>
+        Population &amp; demographic analytics
+      </SectionTitle>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Kpi icon={Users} label="Registered population" value={d.area.population.toLocaleString()} sub={`${d.area.male.toLocaleString()} M · ${d.area.female.toLocaleString()} F`} tint="#3752AE" />
+        <Kpi icon={Scale} label="Sex ratio" value={`${d.sexRatio}`} sub="males per 100 females" tint="#0EA5E9" />
+        <Kpi icon={Users} label="Working-age share" value={`${d.workingPct}%`} sub={`${d.area.workingAge.toLocaleString()} aged 15–64`} tint="#6D28D9" />
+        <Kpi icon={Globe} label="Foreign residents" value={`${d.foreignPct.toFixed(1)}%`} sub={`${d.area.foreign.toLocaleString()} people`} tint="#F59E0B" />
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card title={`Applications per ${perLabel}`} sub="When cases were submitted" className="lg:col-span-2">
-          <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={r.series} margin={{ left: 4, right: 8, top: 8 }}>
+        <Card title="Components of population change" sub="What drives growth each month · national" className="lg:col-span-2">
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={d.change} margin={{ left: 4, right: 8, top: 8 }} barGap={2}>
               <CartesianGrid strokeDasharray="3 3" stroke="#EEF0F4" vertical={false} />
-              <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} interval="preserveStartEnd" />
-              <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} width={40} />
-              <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [`${v} applications`, ""]} />
-              <Bar dataKey="requests" fill="#3752AE" radius={[4, 4, 0, 0]} barSize={18} />
+              <XAxis dataKey="month" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} interval="preserveStartEnd" />
+              <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: "#9CA3AF" }} width={36} />
+              <Tooltip contentStyle={tooltipStyle} />
+              <Bar dataKey="natural" name="Natural increase" fill="#10B981" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="migration" name="Net migration" fill="#3752AE" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
-        </Card>
-        <Card title="Top provinces" sub="By applications received">
-          <div className="space-y-2.5 max-h-[220px] overflow-y-auto pr-1">
-            {r.provinces.map((p) => (
-              <div key={p.name}>
-                <div className="flex items-center justify-between text-sm mb-1">
-                  <span className="text-gray-600 truncate">{p.name}</span>
-                  <span className="text-gray-800 font-medium tabular-nums">{p.value.toLocaleString()}</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-[#3752AE]"
-                    style={{ width: `${(p.value / (r.provinces[0]?.value || 1)) * 100}%` }}
-                  />
-                </div>
-              </div>
-            ))}
+          <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
+            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /> Natural increase (births − deaths)</span>
+            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#3752AE]" /> Net migration (in − out)</span>
           </div>
         </Card>
+        <Card title="Concentration" sub={`Largest ${d.area.childLabel.replace(/s$/, "").toLowerCase() || "area"} in ${d.area.name}`}>
+          {d.childRows.length > 0 ? (
+            <>
+              <div className="flex flex-col items-center justify-center py-2">
+                <p className="text-4xl font-bold text-gray-800">{d.concentration.toFixed(0)}%</p>
+                <p className="text-sm text-gray-500 mt-1 text-center">
+                  of the population lives in <span className="font-medium text-gray-700">{d.topChild}</span>
+                </p>
+              </div>
+              <div className="mt-3 space-y-2">
+                {d.childRows.slice(0, 5).map((rg) => (
+                  <div key={rg.name}>
+                    <div className="flex items-center justify-between text-xs mb-1">
+                      <span className="text-gray-600 truncate pr-2">{rg.name}</span>
+                      <span className="text-gray-500 tabular-nums">{rg.share.toFixed(1)}%</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(rg.share / d.maxShare) * 100}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="text-sm text-gray-400 py-8 text-center">Village level — no further breakdown.</p>
+          )}
+        </Card>
       </div>
-
-      {/* ── 3. Processing & SLA ── */}
-      <SectionTitle sub="Turnaround against each service's own target, and rework">Processing &amp; SLA</SectionTitle>
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {d.childRows.length > 0 && (
         <Card
-          title="Turnaround by service"
-          sub="Each service is measured against its own target, not one shared deadline"
-          className="lg:col-span-2"
+          title={`${d.area.childLabel} of ${d.area.name}`}
+          sub={`Distribution and structure across ${d.childRows.length} ${d.area.childLabel.toLowerCase()}`}
         >
           <ReportTable
-            head={["Service", "Closed", "Target", "Avg days", "Within target", "Overdue"]}
-            rows={r.services.map((s) => [
-              <ServiceCell key="s" id={s.id} />,
-              s.closed.toLocaleString(),
-              `${s.target}d`,
-              <span key="d" className={s.avgDays <= s.target ? "text-emerald-600" : "text-red-500"}>{s.avgDays}</span>,
-              <span key="sla" className={s.sla >= 90 ? "text-emerald-600" : s.sla >= 85 ? "text-amber-600" : "text-red-500"}>{s.sla}%</span>,
-              s.overdue.toLocaleString(),
-            ])}
-          />
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-3 text-[11px] text-gray-500">
-            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-emerald-500" /> On target ≥ 90%</span>
-            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-amber-500" /> At risk 85–89%</span>
-            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-500" /> Breaching &lt; 85%</span>
-          </div>
-        </Card>
-        <Card title="Returns &amp; rejections" sub="Rework and its causes">
-          <div className="grid grid-cols-2 gap-3 mb-4">
-            <div className="rounded-xl bg-orange-50 border border-orange-100 p-3">
-              <p className="text-xs text-orange-600 font-medium">Returned</p>
-              <p className="text-2xl font-bold text-gray-800 mt-1">{r.returns.toLocaleString()}</p>
-            </div>
-            <div className="rounded-xl bg-red-50 border border-red-100 p-3">
-              <p className="text-xs text-red-600 font-medium">Rejected</p>
-              <p className="text-2xl font-bold text-gray-800 mt-1">{r.rejected.toLocaleString()}</p>
-            </div>
-          </div>
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 mb-2">Top reasons</p>
-          <div className="space-y-2">
-            {r.reasonRows.map((row) => (
-              <div key={row.reason}>
-                <div className="flex items-center justify-between text-xs mb-1">
-                  <span className="text-gray-600 truncate">{row.reason}</span>
-                  <span className="text-gray-500">{row.count}</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-[#3752AE]"
-                    style={{ width: `${(row.count / (r.reasonRows[0]?.count || 1)) * 100}%` }}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
-      </div>
-
-      {/* ── 4. Certificates & productivity ── */}
-      <SectionTitle sub="Issuance, family book impact and workload per officer">Certificates &amp; productivity</SectionTitle>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Kpi icon={FileCheck2} label="Issued" value={r.certs.issued.toLocaleString()} tint="#10B981" />
-        <Kpi icon={RotateCcw} label="Certified copies" value={r.certs.reissued.toLocaleString()} tint="#0EA5E9" />
-        <Kpi icon={Ban} label="Revoked" value={r.certs.revoked.toLocaleString()} tint="#EF4444" />
-        <Kpi icon={ScanLine} label="QR verifications" value={r.certs.qrScans.toLocaleString()} sub="Estimated from issued certificates" tint="#3752AE" />
-      </div>
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card title="Family Book impact" sub="Household changes these events trigger">
-          <div className="space-y-3">
-            {[
-              { label: "Members added (births)", value: r.familyBook.added, color: "#10B981" },
-              { label: "Members removed (deaths)", value: r.familyBook.removed, color: "#EF4444" },
-              { label: "Status updates", value: r.familyBook.statusUpdates, color: "#3752AE" },
-            ].map((row) => (
-              <div key={row.label} className="flex items-center justify-between">
-                <span className="flex items-center gap-2 text-sm text-gray-600">
-                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: row.color }} />
-                  {row.label}
-                </span>
-                <span className="text-sm font-semibold text-gray-800">{row.value.toLocaleString()}</span>
-              </div>
-            ))}
-          </div>
-        </Card>
-        <Card title="Cases processed by officer" sub="Assigned cases in this period" className="lg:col-span-2">
-          <ReportTable
-            head={["Officer", "Processed", "Issued", "Avg days"]}
-            rows={r.officers.map((o) => [
-              o.name,
-              o.processed.toLocaleString(),
-              o.issued.toLocaleString(),
-              `${o.avgDays}`,
+            head={[d.area.childLabel.replace(/s$/, ""), "Population", "Share", "Households", "Sex ratio", "Working-age"]}
+            rows={d.childRows.map((rg) => [
+              <span key="p" className="text-gray-800">{rg.name}</span>,
+              rg.population.toLocaleString(),
+              `${rg.share.toFixed(1)}%`,
+              rg.households.toLocaleString(),
+              `${rg.sexRatio}`,
+              `${rg.workingPct}%`,
             ])}
           />
         </Card>
-      </div>
+      )}
     </div>
-  );
-}
-
-function ServiceCell({ id }: { id: string }) {
-  const svc = SERVICE_BY_ID[id];
-  return (
-    <span className="inline-flex items-center gap-2 text-gray-700 whitespace-nowrap">
-      <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
-      {svc?.short ?? id}
-    </span>
   );
 }
 

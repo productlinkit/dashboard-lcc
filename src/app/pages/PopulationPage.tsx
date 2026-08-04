@@ -1,27 +1,38 @@
 import { useEffect, useMemo, useState } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { Search, Users, Home, UserCheck, Baby, Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download } from "lucide-react";
+import {
+  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
+  PieChart, Pie, Cell,
+} from "recharts";
+import {
+  Search, Users, Home, Briefcase, TrendingUp, TrendingDown, Baby, Globe, ArrowLeftRight,
+  Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download,
+} from "lucide-react";
 import {
   CITIZENS,
   HOUSEHOLDS,
   POPULATION_SUMMARY,
-  PROVINCE_NAMES,
-  ageDistribution,
+  DEMOGRAPHIC_TREND,
+  WORKING_AGE,
+  areaStat,
   type Citizen,
   type Household,
 } from "../data/population";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
+import { LocationFilter, NO_LOCATION, type LocationValue } from "../components/LocationFilter";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "../components/ui/dialog";
 import { PersonRecord } from "../components/PersonRecord";
 
 const MALE_COLOR = "#3752AE";
 const FEMALE_COLOR = "#EC4899";
+const BIRTH_COLOR = "#10B981";
+const DEATH_COLOR = "#64748B";
+const IN_COLOR = "#3752AE";
+const OUT_COLOR = "#F59E0B";
+const LOCAL_COLOR = "#3752AE";
+const FOREIGN_COLOR = "#F59E0B";
+const tooltipStyle = { borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 };
 
 const STATUS_META: Record<string, { label: string; color: string; bg: string }> = {
   active: { label: "Active", color: "#047857", bg: "#D1FAE5" },
@@ -29,36 +40,21 @@ const STATUS_META: Record<string, { label: string; color: string; bg: string }> 
   moved: { label: "Moved out", color: "#B45309", bg: "#FEF3C7" },
 };
 
-const PROVINCE_OPTIONS = PROVINCE_NAMES.map((p) => ({ value: p, label: p }));
 const GENDER_OPTIONS = [
   { value: "male", label: "Male", color: MALE_COLOR },
   { value: "female", label: "Female", color: FEMALE_COLOR },
 ];
-const CITIZEN_STATUS_OPTIONS = Object.entries(STATUS_META).map(([value, m]) => ({
-  value,
-  label: m.label,
-  color: m.color,
-}));
+const CITIZEN_STATUS_OPTIONS = Object.entries(STATUS_META).map(([value, m]) => ({ value, label: m.label, color: m.color }));
 
 function Kpi({
-  icon: Icon,
-  label,
-  value,
-  sub,
-  tone,
+  icon: Icon, label, value, sub, tone,
 }: {
   icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: string;
-  sub: string;
-  tone: string;
+  label: string; value: string; sub: string; tone: string;
 }) {
   return (
     <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex items-start gap-3">
-      <span
-        className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-        style={{ backgroundColor: `${tone}14`, color: tone }}
-      >
+      <span className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ backgroundColor: `${tone}14`, color: tone }}>
         <Icon className="w-5 h-5" />
       </span>
       <div className="min-w-0">
@@ -73,10 +69,7 @@ function Kpi({
 function StatusChip({ status }: { status: string }) {
   const m = STATUS_META[status];
   return (
-    <span
-      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap"
-      style={{ color: m.color, backgroundColor: m.bg }}
-    >
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap" style={{ color: m.color, backgroundColor: m.bg }}>
       <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: m.color }} />
       {m.label}
     </span>
@@ -112,7 +105,7 @@ function exportCitizens(rows: Citizen[]) {
 export function PopulationPage() {
   const [tab, setTab] = useState<"citizens" | "households">("citizens");
   const [query, setQuery] = useState("");
-  const [provinces, setProvinces] = useState<string[]>([]);
+  const [location, setLocation] = useState<LocationValue>(NO_LOCATION);
   const [genders, setGenders] = useState<string[]>([]);
   const [statuses, setStatuses] = useState<string[]>([]);
   const [page, setPage] = useState(1);
@@ -120,27 +113,34 @@ export function PopulationPage() {
   const [openHousehold, setOpenHousehold] = useState<Household | null>(null);
   const [openPerson, setOpenPerson] = useState<Citizen | null>(null);
 
+  const inLocation = (o: { province: string; district: string; village: string }) =>
+    (!location.province || o.province === location.province) &&
+    (!location.district || o.district === location.district) &&
+    (!location.village || o.village === location.village);
+
   const citizenRows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return CITIZENS.filter((c) => {
-      if (provinces.length && !provinces.includes(c.province)) return false;
+      if (!inLocation(c)) return false;
       if (genders.length && !genders.includes(c.gender)) return false;
       if (statuses.length && !statuses.includes(c.status)) return false;
       if (q && !`${c.uin} ${c.name} ${c.householdNo} ${c.village} ${c.province}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [query, provinces, genders, statuses]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, location, genders, statuses]);
 
   const householdRows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return HOUSEHOLDS.filter((h) => {
-      if (provinces.length && !provinces.includes(h.province)) return false;
+      if (!inLocation(h)) return false;
       if (q && !`${h.no} ${h.head} ${h.village} ${h.district} ${h.province}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [query, provinces]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, location]);
 
-  useEffect(() => setPage(1), [tab, query, provinces, genders, statuses, pageSize]);
+  useEffect(() => setPage(1), [tab, query, location, genders, statuses, pageSize]);
 
   const totalRows = tab === "citizens" ? citizenRows.length : householdRows.length;
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
@@ -149,21 +149,34 @@ export function PopulationPage() {
   const pageCitizens = citizenRows.slice(start, start + pageSize);
   const pageHouseholds = householdRows.slice(start, start + pageSize);
 
-  /* The pyramid follows the filters, so it explains the table below it. */
-  const ageData = useMemo(() => ageDistribution(citizenRows), [citizenRows]);
+  // The demographic overview is scoped to the selected area (country when none).
+  const area = useMemo(() => areaStat(location.province, location.district, location.village), [location]);
+  const scoped = !!location.province;
+
+  const genderData = [
+    { name: "Male", value: area.male, color: MALE_COLOR },
+    { name: "Female", value: area.female, color: FEMALE_COLOR },
+  ];
+  const originData = [
+    { name: "Lao nationals", value: area.population - area.foreign, color: LOCAL_COLOR },
+    { name: "Foreign residents", value: area.foreign, color: FOREIGN_COLOR },
+  ];
+  const avgHousehold = area.households ? area.population / area.households : 0;
+  const workingPct = area.population ? Math.round((area.workingAge / area.population) * 100) : 0;
+  const maxChild = area.children[0]?.population ?? 1;
 
   const s = POPULATION_SUMMARY;
-  const topProvinces = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const c of CITIZENS) counts[c.province] = (counts[c.province] ?? 0) + 1;
-    return Object.entries(counts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6);
-  }, []);
-  const maxProvince = topProvinces[0]?.[1] ?? 1;
+  const growthUp = s.growthPct >= 0;
+  const changeSeries = DEMOGRAPHIC_TREND.map((m) => ({
+    month: m.month,
+    births: m.births,
+    deaths: m.deaths,
+    movedIn: m.movedIn,
+    movedOut: m.movedOut,
+    population: m.population,
+  }));
 
-  /* Opening a citizen replaces the page, the same way Watchlist Search does —
-   * the record is too big to read comfortably inside a dialog. */
+  /* Opening a citizen replaces the page, the same way Watchlist Search does. */
   if (openPerson) {
     return (
       <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -191,7 +204,7 @@ export function PopulationPage() {
         <div>
           <h1 className="text-xl font-bold text-gray-800">Population &amp; Households</h1>
           <p className="text-sm text-gray-400 mt-0.5">
-            Citizen registry and family book — search by UIN or name, open a household to see its members.
+            Registered population of {area.name} — filter by province, district or village.
           </p>
         </div>
         <button
@@ -202,62 +215,31 @@ export function PopulationPage() {
         </button>
       </div>
 
-      {/* KPIs */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <Kpi
-          icon={Users}
-          label="Registered citizens"
-          value={s.citizens.toLocaleString()}
-          sub={`${s.male.toLocaleString()} male · ${s.female.toLocaleString()} female`}
-          tone="#3752AE"
-        />
-        <Kpi
-          icon={Home}
-          label="Family books"
-          value={s.households.toLocaleString()}
-          sub={`Avg ${s.avgHouseholdSize.toFixed(1)} members per household`}
-          tone="#10B981"
-        />
-        <Kpi
-          icon={UserCheck}
-          label="Active records"
-          value={s.active.toLocaleString()}
-          sub={`${s.deceased} deceased · ${s.moved} moved out`}
-          tone="#0F766E"
-        />
-        <Kpi
-          icon={Baby}
-          label="Under 18"
-          value={s.minors.toLocaleString()}
-          sub={`${s.seniors.toLocaleString()} aged 60 and over`}
-          tone="#F59E0B"
-        />
+      {/* Location filter — scopes the whole page */}
+      <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
+        <LocationFilter value={location} onChange={setLocation} />
       </div>
 
-      {/* Distribution */}
+      {/* KPIs (scoped to the selected area) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        <Kpi icon={Users} label="Registered population" value={area.population.toLocaleString()} sub={`${area.male.toLocaleString()} male · ${area.female.toLocaleString()} female`} tone="#3752AE" />
+        <Kpi icon={Home} label="Households" value={area.households.toLocaleString()} sub={`Avg ${avgHousehold.toFixed(1)} people per household`} tone="#10B981" />
+        <Kpi icon={Briefcase} label="Working age (15–64)" value={area.workingAge.toLocaleString()} sub={`${workingPct}% · dependency ${area.workingAge ? Math.round(((area.population - area.workingAge) / area.workingAge) * 100) : 0}%`} tone="#6D28D9" />
+        <Kpi icon={Globe} label="Foreign residents" value={area.foreign.toLocaleString()} sub={area.population ? `${((area.foreign / area.population) * 100).toFixed(1)}% of population` : "—"} tone="#F59E0B" />
+      </div>
+
+      {/* Age & gender + composition (scoped) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-800">Age and gender distribution</h2>
-          <p className="text-sm text-gray-400 mb-3">
-            {citizenRows.length.toLocaleString()} citizens matching the current filters
-          </p>
-          <div className="h-72">
+          <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {area.name}</h2>
+          <p className="text-sm text-gray-400 mb-3">Registered population by age band · working age {WORKING_AGE.from}–{WORKING_AGE.to}</p>
+          <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={ageData} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
+              <BarChart data={area.ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
                 <CartesianGrid horizontal={false} stroke="#F1F5F9" />
-                <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} />
-                <YAxis
-                  type="category"
-                  dataKey="band"
-                  tick={{ fill: "#64748B", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  width={52}
-                />
-                <Tooltip
-                  cursor={{ fill: "#F8FAFC" }}
-                  contentStyle={{ borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 }}
-                />
+                <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
+                <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
                 <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
                 <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
@@ -266,34 +248,148 @@ export function PopulationPage() {
           </div>
         </div>
 
-        <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-800">Citizens by province</h2>
-          <p className="text-sm text-gray-400 mb-4">Top six by registered population</p>
-          <div className="space-y-3">
-            {topProvinces.map(([name, count]) => (
-              <div key={name}>
-                <div className="flex items-center justify-between text-sm mb-1">
-                  <span className="text-gray-600 truncate pr-2">{name}</span>
-                  <span className="font-semibold text-gray-800">{count.toLocaleString()}</span>
+        <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
+          <h2 className="text-base font-semibold text-gray-800">Composition</h2>
+          <p className="text-sm text-gray-400">Gender and nationality</p>
+          <div className="flex-1 flex flex-col justify-center divide-y divide-gray-50 mt-1">
+            {[
+              { title: "Gender", data: genderData },
+              { title: "Nationality", data: originData },
+            ].map((dd) => {
+              const total = dd.data.reduce((a, e) => a + e.value, 0);
+              return (
+                <div key={dd.title} className="flex items-center gap-4 py-3.5">
+                  <div className="w-[76px] h-[76px] flex-shrink-0">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie data={dd.data} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={24} outerRadius={38} paddingAngle={2} stroke="none">
+                          {dd.data.map((e) => (
+                            <Cell key={e.name} fill={e.color} />
+                          ))}
+                        </Pie>
+                        <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => v.toLocaleString()} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 mb-1.5">{dd.title}</p>
+                    <div className="space-y-1.5">
+                      {dd.data.map((e) => (
+                        <div key={e.name} className="flex items-center gap-2 text-sm">
+                          <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: e.color }} />
+                          <span className="text-gray-600 flex-1 truncate">{e.name}</span>
+                          <span className="text-gray-400 tabular-nums text-xs">{e.value.toLocaleString()}</span>
+                          <span className="font-semibold text-gray-800 tabular-nums w-9 text-right">
+                            {total ? Math.round((e.value / total) * 100) : 0}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
-                <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
-                  <div
-                    className="h-full rounded-full"
-                    style={{ width: `${(count / maxProvince) * 100}%`, backgroundColor: MALE_COLOR }}
-                  />
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>
+
+      {scoped ? (
+        /* Area breakdown — the children of the selected level */
+        area.children.length > 0 && (
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100">
+              <h2 className="text-base font-semibold text-gray-800">{area.childLabel} of {area.name}</h2>
+              <p className="text-sm text-gray-400">Population and households within this area</p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                    <th className="px-5 py-3 font-medium">{area.childLabel.replace(/s$/, "")}</th>
+                    <th className="px-4 py-3 font-medium w-1/2">Population</th>
+                    <th className="pl-4 pr-5 py-3 font-medium text-right">Households</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {area.children.map((c) => (
+                    <tr key={c.name} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                      <td className="px-5 py-3 text-gray-800">{c.name}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <span className="tabular-nums text-gray-700 w-10 flex-shrink-0">{c.population.toLocaleString()}</span>
+                          <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden flex-1 min-w-[40px]">
+                            <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(c.population / maxChild) * 100}%` }} />
+                          </div>
+                        </div>
+                      </td>
+                      <td className="pl-4 pr-5 py-3 text-right text-gray-600 tabular-nums">{c.households.toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      ) : (
+        /* National demographic trend — only meaningful at country level */
+        <>
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+            <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${s.growthPct}%`} sub={`${growthUp ? "+" : ""}${s.growthAbs.toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
+            <Kpi icon={Baby} label="Births (12 mo)" value={s.births.toLocaleString()} sub={`natural increase +${s.naturalIncrease}`} tone="#10B981" />
+            <Kpi icon={Baby} label="Deaths (12 mo)" value={s.deaths.toLocaleString()} sub="registered deaths" tone="#64748B" />
+            <Kpi icon={ArrowLeftRight} label="Net migration" value={`${s.netMigration >= 0 ? "+" : ""}${s.netMigration}`} sub={`${s.movedIn} in · ${s.movedOut} out`} tone="#3752AE" />
+          </div>
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
+              <h2 className="text-base font-semibold text-gray-800">Population growth</h2>
+              <p className="text-sm text-gray-400 mb-3">Registered population, last 12 months</p>
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={changeSeries} margin={{ top: 4, right: 12, bottom: 0, left: 4 }}>
+                    <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                    <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={48} domain={["dataMin - 40", "dataMax + 40"]} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [v.toLocaleString(), "Population"]} />
+                    <Line type="monotone" dataKey="population" stroke="#3752AE" strokeWidth={2.5} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
+              <div className="flex items-start justify-between gap-4 mb-3">
+                <div>
+                  <h2 className="text-base font-semibold text-gray-800">Births, deaths &amp; migration</h2>
+                  <p className="text-sm text-gray-400">Monthly flows</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs flex-shrink-0">
+                  <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: BIRTH_COLOR }} /> Births</span>
+                  <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: DEATH_COLOR }} /> Deaths</span>
+                  <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: OUT_COLOR }} /> Net migration</span>
+                </div>
+              </div>
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
+                    <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                    <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
+                    <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                    <Bar dataKey="births" name="Births" fill={BIRTH_COLOR} radius={[3, 3, 0, 0]} />
+                    <Bar dataKey="deaths" name="Deaths" fill={DEATH_COLOR} radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Tabs + filters */}
       <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm space-y-3">
         <div className="flex flex-wrap gap-1.5">
           {([
-            { id: "citizens", label: "Citizen registry", count: CITIZENS.length },
-            { id: "households", label: "Family books", count: HOUSEHOLDS.length },
+            { id: "citizens", label: "Citizen registry", count: citizenRows.length },
+            { id: "households", label: "Family books", count: householdRows.length },
           ] as const).map((t) => {
             const active = tab === t.id;
             return (
@@ -305,11 +401,7 @@ export function PopulationPage() {
                 }`}
               >
                 {t.label}
-                <span
-                  className={`text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${
-                    active ? "bg-white/20 text-white" : "bg-gray-100 text-gray-600"
-                  }`}
-                >
+                <span className={`text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${active ? "bg-white/20 text-white" : "bg-gray-100 text-gray-600"}`}>
                   {t.count.toLocaleString()}
                 </span>
               </button>
@@ -323,28 +415,16 @@ export function PopulationPage() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder={
-                tab === "citizens"
-                  ? "Search by UIN, name, household no, or village…"
-                  : "Search by family book no, head of household, or village…"
-              }
+              placeholder={tab === "citizens" ? "Search by UIN, name, household no, or village…" : "Search by family book no, head of household, or village…"}
               className="flex-1 bg-transparent outline-none text-sm text-gray-700 placeholder:text-gray-400"
             />
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <MultiSelectFilter label="Province" options={PROVINCE_OPTIONS} selected={provinces} onChange={setProvinces} />
-            {tab === "citizens" && (
-              <>
-                <MultiSelectFilter label="Gender" options={GENDER_OPTIONS} selected={genders} onChange={setGenders} />
-                <MultiSelectFilter
-                  label="Status"
-                  options={CITIZEN_STATUS_OPTIONS}
-                  selected={statuses}
-                  onChange={setStatuses}
-                />
-              </>
-            )}
-          </div>
+          {tab === "citizens" && (
+            <div className="flex flex-wrap items-center gap-2">
+              <MultiSelectFilter label="Gender" options={GENDER_OPTIONS} selected={genders} onChange={setGenders} />
+              <MultiSelectFilter label="Status" options={CITIZEN_STATUS_OPTIONS} selected={statuses} onChange={setStatuses} />
+            </div>
+          )}
         </div>
       </div>
 
@@ -352,8 +432,7 @@ export function PopulationPage() {
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h2 className="text-base font-semibold text-gray-800">
-            {totalRows.toLocaleString()} {tab === "citizens" ? "citizen" : "household"}
-            {totalRows !== 1 ? "s" : ""}
+            {totalRows.toLocaleString()} {tab === "citizens" ? "citizen" : "household"}{totalRows !== 1 ? "s" : ""}
           </h2>
           <div className="flex items-center gap-2 text-sm text-gray-500">
             <span className="hidden sm:inline">Rows</span>
@@ -363,9 +442,7 @@ export function PopulationPage() {
               className="bg-gray-50 border border-gray-200 rounded-lg pl-2.5 pr-7 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
             >
               {[10, 25, 50, 100].map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
+                <option key={n} value={n}>{n}</option>
               ))}
             </select>
           </div>
@@ -395,19 +472,15 @@ export function PopulationPage() {
                       {c.name}
                       <span className="block text-[11px] text-gray-400">{c.relation}</span>
                     </td>
-                    <td className="px-4 py-3">
-                      <GenderDot gender={c.gender} />
-                    </td>
+                    <td className="px-4 py-3"><GenderDot gender={c.gender} /></td>
                     <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{c.dob}</td>
                     <td className="px-4 py-3 text-gray-600">{c.age}</td>
                     <td className="px-4 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{c.householdNo}</td>
                     <td className="px-4 py-3 text-gray-600">
                       {c.village}
-                      <span className="block text-[11px] text-gray-400">{c.province}</span>
+                      <span className="block text-[11px] text-gray-400">{c.district}, {c.province}</span>
                     </td>
-                    <td className="px-4 py-3">
-                      <StatusChip status={c.status} />
-                    </td>
+                    <td className="px-4 py-3"><StatusChip status={c.status} /></td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap">
                       <div className="flex items-center gap-1.5">
                         <button
@@ -428,9 +501,7 @@ export function PopulationPage() {
                 ))}
                 {totalRows === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">
-                      No citizens match your filters.
-                    </td>
+                    <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">No citizens match your filters.</td>
                   </tr>
                 )}
               </tbody>
@@ -451,11 +522,7 @@ export function PopulationPage() {
               </thead>
               <tbody>
                 {pageHouseholds.map((h) => (
-                  <tr
-                    key={h.no}
-                    onClick={() => setOpenHousehold(h)}
-                    className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer"
-                  >
+                  <tr key={h.no} onClick={() => setOpenHousehold(h)} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer">
                     <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{h.no}</td>
                     <td className="px-4 py-3 text-gray-800">{h.head}</td>
                     <td className="px-4 py-3 text-gray-600">{h.members.length}</td>
@@ -475,9 +542,7 @@ export function PopulationPage() {
                 ))}
                 {totalRows === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-5 py-12 text-center text-sm text-gray-400">
-                      No households match your filters.
-                    </td>
+                    <td colSpan={8} className="px-5 py-12 text-center text-sm text-gray-400">No households match your filters.</td>
                   </tr>
                 )}
               </tbody>
@@ -501,9 +566,7 @@ export function PopulationPage() {
               >
                 <ChevronLeft className="w-4 h-4" /> Prev
               </button>
-              <span className="text-sm text-gray-500">
-                Page {currentPage} of {totalPages}
-              </span>
+              <span className="text-sm text-gray-500">Page {currentPage} of {totalPages}</span>
               <button
                 onClick={() => setPage(currentPage + 1)}
                 disabled={currentPage >= totalPages}
@@ -522,9 +585,7 @@ export function PopulationPage() {
           <DialogHeader>
             <DialogTitle>Family book {openHousehold?.no}</DialogTitle>
             <DialogDescription>
-              {openHousehold
-                ? `${openHousehold.village}, ${openHousehold.district}, ${openHousehold.province} · registered ${openHousehold.registered}`
-                : ""}
+              {openHousehold ? `${openHousehold.village}, ${openHousehold.district}, ${openHousehold.province} · registered ${openHousehold.registered}` : ""}
             </DialogDescription>
           </DialogHeader>
 
@@ -543,9 +604,7 @@ export function PopulationPage() {
                   <p className="text-xs text-gray-400">Male / female</p>
                 </div>
                 <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-lg font-bold text-gray-800">
-                    {openHousehold.members.filter((m) => m.age < 18).length}
-                  </p>
+                  <p className="text-lg font-bold text-gray-800">{openHousehold.members.filter((m) => m.age < 18).length}</p>
                   <p className="text-xs text-gray-400">Under 18</p>
                 </div>
               </div>
@@ -571,20 +630,13 @@ export function PopulationPage() {
                           <span className="block font-mono text-[11px] text-gray-400">{m.uin}</span>
                         </td>
                         <td className="px-4 py-2.5 text-gray-600">{m.relation}</td>
-                        <td className="px-4 py-2.5">
-                          <GenderDot gender={m.gender} />
-                        </td>
+                        <td className="px-4 py-2.5"><GenderDot gender={m.gender} /></td>
                         <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">{m.dob}</td>
                         <td className="px-4 py-2.5 text-gray-600">{m.age}</td>
-                        <td className="px-4 py-2.5">
-                          <StatusChip status={m.status} />
-                        </td>
+                        <td className="px-4 py-2.5"><StatusChip status={m.status} /></td>
                         <td className="pl-2 pr-4 py-2.5 w-px">
                           <button
-                            onClick={() => {
-                              setOpenHousehold(null);
-                              setOpenPerson(m);
-                            }}
+                            onClick={() => { setOpenHousehold(null); setOpenPerson(m); }}
                             title="See documents"
                             className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-[#3752AE] hover:bg-[#3752AE]/10"
                           >

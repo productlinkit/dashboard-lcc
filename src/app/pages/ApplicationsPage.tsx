@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search, Eye, Download, ChevronLeft, ChevronRight } from "lucide-react";
-import { APPLICATIONS, STATUS_ORDER, STATUS_META } from "../data/mockData";
+import { APPLICATIONS, STATUS_ORDER, STATUS_META, lastActivityOf, daysAgo } from "../data/mockData";
 import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
+import { paymentStateFor, PAYMENT_STATE_META, PAYMENT_OPTIONS } from "../data/payments";
 import { StatusBadge } from "../components/StatusBadge";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
 import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
@@ -9,14 +10,29 @@ import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../component
 const SERVICE_OPTIONS = SERVICES.map((s) => ({ value: s.id, label: s.label, color: s.color }));
 const STATUS_OPTIONS = STATUS_ORDER.map((s) => ({ value: s, label: STATUS_META[s].label, color: STATUS_META[s].color }));
 
+/* Statuses that are still moving — used to flag a case that hasn't been touched
+ * in a while as stale, since only open cases can go stale. */
+const OPEN_STATUSES = new Set(["draft", "submitted", "certified", "under-review", "returned"]);
+const STALE_DAYS = 14;
+
+function relativeDays(date: string): string {
+  const d = daysAgo(date);
+  if (d === 0) return "Today";
+  if (d === 1) return "Yesterday";
+  if (d < 30) return `${d}d ago`;
+  return date;
+}
+
 function exportCsv(rows: typeof APPLICATIONS) {
-  const header = ["Ref No", "Applicant", "Service", "Province", "Submitted", "Officer", "Status"];
+  const header = ["Ref No", "Applicant", "Service", "Province", "Submitted", "Last activity", "Payment", "Officer", "Status"];
   const body = rows.map((a) => [
     a.id,
     a.applicant,
     SERVICE_BY_ID[a.serviceId]?.label ?? a.serviceId,
     a.province,
     a.submitted,
+    lastActivityOf(a),
+    PAYMENT_STATE_META[paymentStateFor(a.id)].label,
     a.officer ?? "",
     STATUS_META[a.status].label,
   ]);
@@ -30,9 +46,23 @@ function exportCsv(rows: typeof APPLICATIONS) {
   URL.revokeObjectURL(url);
 }
 
+function PaymentChip({ appId }: { appId: string }) {
+  const m = PAYMENT_STATE_META[paymentStateFor(appId)];
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap"
+      style={{ color: m.color, backgroundColor: m.bg }}
+    >
+      <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: m.color }} />
+      {m.label}
+    </span>
+  );
+}
+
 export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => void }) {
   const [services, setServices] = useState<string[]>([]);
   const [statuses, setStatuses] = useState<string[]>([]);
+  const [payments, setPayments] = useState<string[]>([]);
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const [query, setQuery] = useState("");
 
@@ -44,14 +74,15 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
     return APPLICATIONS.filter((a) => {
       if (statuses.length && !statuses.includes(a.status)) return false;
       if (services.length && !services.includes(a.serviceId)) return false;
+      if (payments.length && !payments.includes(paymentStateFor(a.id))) return false;
       if (!inRange(a.submitted, dateRange)) return false;
       if (q && !`${a.id} ${a.applicant} ${a.province}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [services, statuses, dateRange, query]);
+  }, [services, statuses, payments, dateRange, query]);
 
   // Reset to first page whenever the result set or page size changes.
-  useEffect(() => setPage(1), [services, statuses, dateRange, query, pageSize]);
+  useEffect(() => setPage(1), [services, statuses, payments, dateRange, query, pageSize]);
 
   const totalRows = rows.length;
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
@@ -65,7 +96,9 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-gray-800">Applications</h1>
-          <p className="text-sm text-gray-400 mt-0.5">Review and process civil registration submissions.</p>
+          <p className="text-sm text-gray-400 mt-0.5">
+            Every case, any status — search the full record and open one to process it.
+          </p>
         </div>
         <button
           onClick={() => exportCsv(rows)}
@@ -91,6 +124,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
           <div className="flex flex-wrap items-center gap-2">
             <MultiSelectFilter label="Services" options={SERVICE_OPTIONS} selected={services} onChange={setServices} />
             <MultiSelectFilter label="Status" options={STATUS_OPTIONS} selected={statuses} onChange={setStatuses} />
+            <MultiSelectFilter label="Payment" options={PAYMENT_OPTIONS} selected={payments} onChange={setPayments} />
             <DateRangeFilter onChange={setDateRange} />
           </div>
         </div>
@@ -122,36 +156,50 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
             <thead>
               <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
                 <th className="px-5 py-3 font-medium">Ref. No.</th>
-                <th className="px-5 py-3 font-medium">Applicant</th>
-                <th className="px-5 py-3 font-medium">Service</th>
-                <th className="px-5 py-3 font-medium">Province</th>
-                <th className="px-5 py-3 font-medium">Submitted</th>
-                <th className="px-5 py-3 font-medium">Officer</th>
-                <th className="px-5 py-3 font-medium">Status</th>
+                <th className="px-4 py-3 font-medium">Applicant</th>
+                <th className="px-4 py-3 font-medium">Service</th>
+                <th className="px-4 py-3 font-medium">Province</th>
+                <th className="px-4 py-3 font-medium">Submitted</th>
+                <th className="px-4 py-3 font-medium">Last activity</th>
+                <th className="px-4 py-3 font-medium">Payment</th>
+                <th className="px-4 py-3 font-medium">Officer</th>
+                <th className="px-4 py-3 font-medium">Status</th>
                 <th className="pl-4 pr-5 py-3 font-medium w-px whitespace-nowrap">Action</th>
               </tr>
             </thead>
             <tbody>
               {pageRows.map((a) => {
                 const svc = SERVICE_BY_ID[a.serviceId];
+                const activity = lastActivityOf(a);
+                const idle = daysAgo(activity);
+                const stale = OPEN_STATUSES.has(a.status) && idle >= STALE_DAYS;
                 return (
                   <tr
                     key={a.id}
                     onClick={() => onOpenCase(a.id)}
                     className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer"
                   >
-                    <td className="px-5 py-3 font-mono text-xs text-gray-500">{a.id}</td>
-                    <td className="px-5 py-3 text-gray-800">{a.applicant}</td>
-                    <td className="px-5 py-3">
-                      <span className="inline-flex items-center gap-2 text-gray-600">
+                    <td className="px-5 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{a.id}</td>
+                    <td className="px-4 py-3 text-gray-800">{a.applicant}</td>
+                    <td className="px-4 py-3">
+                      <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
                         <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
                         {svc?.short}
                       </span>
                     </td>
-                    <td className="px-5 py-3 text-gray-600">{a.province}</td>
-                    <td className="px-5 py-3 text-gray-500">{a.submitted}</td>
-                    <td className="px-5 py-3 text-gray-500">{a.officer ?? "—"}</td>
-                    <td className="px-5 py-3">
+                    <td className="px-4 py-3 text-gray-600">{a.province}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{a.submitted}</td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <span className={stale ? "text-red-600 font-medium" : "text-gray-500"} title={stale ? `No activity for ${idle} days` : activity}>
+                        {relativeDays(activity)}
+                      </span>
+                      {stale && <span className="block text-[11px] text-red-400">stale</span>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <PaymentChip appId={a.id} />
+                    </td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{a.officer ?? "—"}</td>
+                    <td className="px-4 py-3">
                       <StatusBadge status={a.status} />
                     </td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
@@ -167,7 +215,7 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
               })}
               {totalRows === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-5 py-12 text-center text-sm text-gray-400">
+                  <td colSpan={10} className="px-5 py-12 text-center text-sm text-gray-400">
                     No applications match your filters.
                   </td>
                 </tr>
