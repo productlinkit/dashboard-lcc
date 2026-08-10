@@ -8,9 +8,63 @@ import {
   DialogDescription,
 } from "./ui/dialog";
 
-export type Signature = { kind: "draw" | "type" | "image"; data: string };
+/*
+ * `data` keeps its original meaning so the certificate preview renders exactly
+ * as before: an image data-URL for draw/upload, the raw text for a typed name.
+ * `dataUrl` is the same mark flattened to a PNG data-URL — that is what the
+ * workflow endpoints want as `signature_data_url`, and a typed name has to be
+ * rasterised before it can be sent.
+ */
+export type Signature = { kind: "draw" | "type" | "image"; data: string; dataUrl?: string };
 
 const SIGN_FONT = '"Brush Script MT", "Segoe Script", "Snell Roundhand", cursive';
+
+const PAD_WIDTH = 440;
+const PAD_HEIGHT = 170;
+
+/** Rasterise a typed name in the signing script onto a transparent canvas. */
+function typedToPng(name: string): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = PAD_WIDTH;
+  canvas.height = PAD_HEIGHT;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  ctx.fillStyle = "#0f172a";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `64px ${SIGN_FONT}`;
+  ctx.fillText(name, PAD_WIDTH / 2, PAD_HEIGHT / 2, PAD_WIDTH - 24);
+  return canvas.toDataURL("image/png");
+}
+
+/** Re-encode an uploaded image as PNG so every signature travels in one format. */
+function imageToPng(src: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, PAD_WIDTH / img.width, PAD_HEIGHT / img.height);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return resolve(src);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    img.onerror = () => resolve(src);
+    img.src = src;
+  });
+}
+
+/**
+ * The PNG data-URL for a signature, whatever it was captured from — the value
+ * a workflow transition sends as `signature_data_url`.
+ */
+export function signatureDataUrl(sig: Signature | null | undefined): string {
+  if (!sig) return "";
+  if (sig.dataUrl) return sig.dataUrl;
+  return sig.kind === "type" ? typedToPng(sig.data) : sig.data;
+}
 
 /** Renders an applied signature (image data-URL or typed cursive text). */
 export function SignatureMark({ sig, className = "" }: { sig: Signature; className?: string }) {
@@ -30,10 +84,13 @@ export function SignaturePad({
   open,
   onClose,
   onApply,
+  onChange,
 }: {
   open: boolean;
   onClose: () => void;
   onApply: (s: Signature) => void;
+  /** Fires with the same mark as onApply — kept for callers that only need the PNG. */
+  onChange?: (dataUrl: string, s: Signature) => void;
 }) {
   const [tab, setTab] = useState<Tab>("draw");
   const [typed, setTyped] = useState("");
@@ -102,22 +159,30 @@ export function SignaturePad({
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => setImage(String(reader.result));
+    // Normalised to PNG on the way in, so `image` is already what gets sent.
+    reader.onload = () => void imageToPng(String(reader.result)).then(setImage);
     reader.readAsDataURL(file);
   }
 
   const canApply = tab === "draw" ? drawn : tab === "type" ? !!typed.trim() : !!image;
 
+  function emit(sig: Signature) {
+    onApply(sig);
+    onChange?.(sig.dataUrl ?? "", sig);
+  }
+
   function apply() {
     if (tab === "draw") {
       if (!drawn) return;
-      onApply({ kind: "draw", data: canvasRef.current!.toDataURL("image/png") });
+      const png = canvasRef.current!.toDataURL("image/png");
+      emit({ kind: "draw", data: png, dataUrl: png });
     } else if (tab === "type") {
-      if (!typed.trim()) return;
-      onApply({ kind: "type", data: typed.trim() });
+      const name = typed.trim();
+      if (!name) return;
+      emit({ kind: "type", data: name, dataUrl: typedToPng(name) });
     } else {
       if (!image) return;
-      onApply({ kind: "image", data: image });
+      emit({ kind: "image", data: image, dataUrl: image });
     }
     onClose();
   }

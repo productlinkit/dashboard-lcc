@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, Eye, Download, ChevronLeft, ChevronRight, BadgeCheck, Ban, Clock } from "lucide-react";
-import { APPLICATIONS, eventDateOf, lastActivityOf, type AppStatus, type Application } from "../data/mockData";
-import { SERVICES, SERVICE_BY_ID, formatLak } from "../serviceConfig";
-import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
+import {
+  Search, Eye, Download, ChevronLeft, ChevronRight, BadgeCheck, Ban, Clock, Loader2, AlertTriangle,
+  Home, Baby, Cross, Heart, HeartCrack, BookUser, FileText, type LucideIcon,
+} from "lucide-react";
+import { toast } from "sonner";
+import { applications, catalog } from "../api/endpoints";
+import { useDebounced, useQuery } from "../api/hooks";
+import { text, type ApplicationRow, type ApplicationSummary, type Service } from "../api/types";
+import { formatLak } from "../serviceConfig";
+import { DateRangeFilter, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 
 /*
  * Civil Registration — the six Phase-1 services and their registers (PRD §11).
@@ -10,85 +16,16 @@ import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../component
  * a certificate, or later revoked. Everything before that still sits in the
  * approval queue, not here.
  *
- * Two dates matter and they differ: the event date (when the birth/death/…
- * happened) and the registration date (when it was recorded in the book).
+ * The register is the case list narrowed to those three states server-side, and
+ * the per-service counters come from /admin/applications/summary rather than a
+ * pass over rows the browser happens to hold.
  */
-const REGISTER_STATUSES = new Set<AppStatus>(["registered", "issued", "revoked"]);
+const REGISTER_STATUSES = ["registered", "issued", "revoked"];
 
-const SVC_BOOK: Record<string, string> = {
-  resident: "RES",
-  birth: "BIR",
-  death: "DEA",
-  marriage: "MAR",
-  divorce: "DIV",
-  "family-book": "FAM",
+/* The catalogue names its icon; the dashboard owns the drawing of it. */
+const ICONS: Record<string, LucideIcon> = {
+  Home, Baby, Cross, Heart, HeartCrack, BookUser,
 };
-
-type RegisterEntry = Application & { regNo: string; registered: string };
-
-/* Register numbers are sequential per service book, assigned in the order events
- * were recorded — so they follow the registration date, not the filing date. */
-function buildRegister(): RegisterEntry[] {
-  const counters: Record<string, number> = {};
-  return APPLICATIONS.filter((a) => REGISTER_STATUSES.has(a.status))
-    .map((a) => ({ ...a, registered: lastActivityOf(a) }))
-    .sort((a, b) => a.registered.localeCompare(b.registered))
-    .map((a) => {
-      const book = SVC_BOOK[a.serviceId] ?? "GEN";
-      counters[book] = (counters[book] ?? 0) + 1;
-      const year = a.registered.slice(0, 4);
-      return { ...a, regNo: `LAO/${book}/${year}/${String(counters[book]).padStart(5, "0")}` };
-    })
-    .reverse(); // newest first
-}
-
-const REGISTER = buildRegister();
-
-interface ServiceStat {
-  id: string;
-  inRegister: number;
-  issued: number;
-  pendingIssue: number;
-}
-
-/* Only register states are counted, so every number has matching rows below. */
-function buildServiceStats(): Record<string, ServiceStat> {
-  const out: Record<string, ServiceStat> = Object.fromEntries(
-    SERVICES.map((s) => [s.id, { id: s.id, inRegister: 0, issued: 0, pendingIssue: 0 }]),
-  );
-  for (const a of APPLICATIONS) {
-    const s = out[a.serviceId];
-    if (!s || !REGISTER_STATUSES.has(a.status)) continue;
-    s.inRegister += 1;
-    if (a.status === "issued") s.issued += 1;
-    if (a.status === "registered") s.pendingIssue += 1;
-  }
-  return out;
-}
-
-const SERVICE_STATS = buildServiceStats();
-
-function exportCsv(rows: RegisterEntry[]) {
-  const header = ["Register No", "Registrant", "Service", "Province", "Event date", "Registered", "Registrar", "Certificate"];
-  const body = rows.map((r) => [
-    r.regNo,
-    r.applicant,
-    SERVICE_BY_ID[r.serviceId]?.label ?? r.serviceId,
-    r.province,
-    eventDateOf(r),
-    r.registered,
-    r.officer ?? "",
-    CERT_META[r.status]?.label ?? r.status,
-  ]);
-  const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
-  const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `civil-register-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
 
 const CERT_META: Record<string, { label: string; color: string; bg: string; icon: React.ComponentType<{ className?: string }> }> = {
   issued: { label: "Issued", color: "#047857", bg: "#D1FAE5", icon: BadgeCheck },
@@ -96,35 +33,105 @@ const CERT_META: Record<string, { label: string; color: string; bg: string; icon
   revoked: { label: "Revoked", color: "#44403C", bg: "#E7E5E4", icon: Ban },
 };
 
+interface ServiceStat {
+  inRegister: number;
+  issued: number;
+  pendingIssue: number;
+}
+
+/** Read the three register states out of a summary's by_status block. */
+function statOf(summary: ApplicationSummary | undefined): ServiceStat {
+  const rows = (summary?.by_status ?? []) as Array<{ status: string; count?: number; total?: number }>;
+  const at = (status: string) => {
+    const row = rows.find((r) => r.status === status);
+    return row?.count ?? row?.total ?? 0;
+  };
+  const issued = at("issued");
+  const registered = at("registered");
+  const revoked = at("revoked");
+  return { inRegister: issued + registered + revoked, issued, pendingIssue: registered };
+}
+
+/** The date an entry reached the register, newest information first. */
+function registeredOn(r: ApplicationRow): string {
+  return (r.issued_at ?? r.closed_at ?? r.updated_at ?? "").slice(0, 10) || "—";
+}
+
 export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string) => void }) {
   const [service, setService] = useState<string | null>(null);
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const [query, setQuery] = useState("");
+  const search = useDebounced(query, 350);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const [exporting, setExporting] = useState(false);
 
-  const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return REGISTER.filter((r) => {
-      if (service && r.serviceId !== service) return false;
-      // A register is browsed by when entries were recorded, not filed.
-      if (!inRange(r.registered, dateRange)) return false;
-      if (q && !`${r.regNo} ${r.id} ${r.applicant} ${r.province}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [service, dateRange, query]);
+  const services = useQuery((signal) => catalog.services({ phase1: true }, signal), []);
+  const serviceList = useMemo<Service[]>(() => services.data ?? [], [services.data]);
+  const serviceCodes = serviceList.map((s) => s.code).join(",");
 
-  useEffect(() => setPage(1), [service, dateRange, query, pageSize]);
+  /* Header totals across the whole register. */
+  const overall = useQuery(
+    (signal) => applications.summary({ status: REGISTER_STATUSES }, signal),
+    [],
+  );
 
-  const totalRows = rows.length;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const currentPage = Math.min(page, totalPages);
+  /* One summary per service tile — counted by the API, not in the browser. */
+  const perService = useQuery(
+    async (signal) => {
+      const entries = await Promise.all(
+        serviceList.map(async (s) => [s.code, await applications.summary({ service_code: s.code }, signal)] as const),
+      );
+      return Object.fromEntries(entries) as Record<string, ApplicationSummary>;
+    },
+    [serviceCodes],
+    { enabled: serviceList.length > 0 },
+  );
+
+  const listQuery = useMemo(
+    () => ({
+      status: REGISTER_STATUSES,
+      service_code: service ?? undefined,
+      search: search.trim() || undefined,
+      date_from: dateRange.from || undefined,
+      date_to: dateRange.to || undefined,
+      sort: "-submitted",
+    }),
+    [service, search, dateRange.from, dateRange.to],
+  );
+
+  const list = useQuery(
+    (signal) => applications.list({ ...listQuery, page, per_page: pageSize }, signal),
+    [service, search, dateRange.from, dateRange.to, page, pageSize],
+  );
+
+  useEffect(() => setPage(1), [service, dateRange.from, dateRange.to, search, pageSize]);
+
+  const rows = list.data?.data ?? [];
+  const totalRows = list.data?.meta.total ?? 0;
+  const totalPages = Math.max(1, list.data?.meta.total_pages ?? 1);
+  const currentPage = list.data?.meta.page ?? page;
   const start = (currentPage - 1) * pageSize;
-  const pageRows = rows.slice(start, start + pageSize);
 
-  const totalRegistered = REGISTER.length;
-  const totalIssued = REGISTER.filter((r) => r.status === "issued").length;
-  const totalPendingIssue = REGISTER.filter((r) => r.status === "registered").length;
+  const totals = statOf(overall.data);
+  const activeService = serviceList.find((s) => s.code === service);
+
+  async function exportRegister() {
+    setExporting(true);
+    try {
+      const csv = await applications.exportCSV(listQuery);
+      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `civil-register-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      toast.error("Export failed", { description: (err as Error).message });
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -133,29 +140,44 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
         <div>
           <h1 className="text-xl font-bold text-gray-800">Civil Registration</h1>
           <p className="text-sm text-gray-400 mt-0.5">
-            The six Phase-1 services and their registers — {totalRegistered} entries · {totalIssued} issued ·{" "}
-            {totalPendingIssue} pending issue.
+            {overall.loading
+              ? "The six Phase-1 services and their registers — loading counts…"
+              : `The six Phase-1 services and their registers — ${totals.inRegister} entries · ${totals.issued} issued · ${totals.pendingIssue} pending issue.`}
           </p>
         </div>
         <button
-          onClick={() => exportCsv(rows)}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto"
+          onClick={() => void exportRegister()}
+          disabled={exporting || totalRows === 0}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          <Download className="w-4 h-4" /> Export register
+          {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export register
         </button>
       </div>
 
+      {services.error && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm text-red-600">{services.error.message}</p>
+          <button
+            onClick={services.refetch}
+            className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Service registers */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-        {SERVICES.map((s) => {
-          const Icon = s.icon;
-          const stat = SERVICE_STATS[s.id];
-          const active = service === s.id;
+        {serviceList.map((s) => {
+          const Icon = ICONS[s.icon] ?? FileText;
+          const stat = statOf(perService.data?.[s.code]);
+          const active = service === s.code;
+          const label = text(s.name);
           return (
             <button
-              key={s.id}
-              onClick={() => setService(active ? null : s.id)}
-              title={active ? "Show all registers" : `Filter the register to ${s.label}`}
+              key={s.code}
+              onClick={() => setService(active ? null : s.code)}
+              title={active ? "Show all registers" : `Filter the register to ${label}`}
               className={`text-left bg-white rounded-2xl border p-4 shadow-sm transition-all ${
                 active ? "border-[#3752AE] ring-1 ring-[#3752AE]/20" : "border-gray-100 hover:border-gray-200"
               }`}
@@ -168,10 +190,10 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                   <Icon className="w-5 h-5" />
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold text-gray-800 truncate">{s.label}</p>
-                  <p className="text-xs text-gray-400 truncate">{s.laLabel}</p>
+                  <p className="text-sm font-semibold text-gray-800 truncate">{label}</p>
+                  <p className="text-xs text-gray-400 truncate">{text(s.name, "lo")}</p>
                 </div>
-                <span className="text-xs font-medium text-gray-500 whitespace-nowrap">{formatLak(s.fee)}</span>
+                <span className="text-xs font-medium text-gray-500 whitespace-nowrap">{formatLak(s.fee_lak)}</span>
               </div>
 
               {/* Colours match the certificate chips in the table below:
@@ -184,7 +206,7 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                 ].map((k) => (
                   <div key={k.label}>
                     <p className="text-lg font-bold leading-tight" style={{ color: k.color }}>
-                      {k.value}
+                      {perService.loading ? "—" : k.value}
                     </p>
                     <p className="text-[11px] text-gray-400">{k.label}</p>
                   </div>
@@ -193,6 +215,16 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
             </button>
           );
         })}
+
+        {services.loading &&
+          [0, 1, 2].map((i) => (
+            <div key={i} className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
+              <div className="flex items-center gap-3 text-gray-300">
+                <Loader2 className="w-5 h-5 animate-spin" />
+                <span className="text-sm text-gray-400">Loading services…</span>
+              </div>
+            </div>
+          ))}
       </div>
 
       {/* Toolbar */}
@@ -225,7 +257,7 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h2 className="text-base font-semibold text-gray-800">
-            {service ? `${SERVICE_BY_ID[service].label} register` : "All registers"}
+            {activeService ? `${text(activeService.name)} register` : "All registers"}
             <span className="text-gray-400 font-normal"> · {totalRows} entries</span>
           </h2>
           <div className="flex items-center gap-2 text-sm text-gray-500">
@@ -260,9 +292,9 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
               </tr>
             </thead>
             <tbody>
-              {pageRows.map((r) => {
-                const svc = SERVICE_BY_ID[r.serviceId];
-                const cert = CERT_META[r.status];
+              {rows.map((r) => {
+                const svc = serviceList.find((s) => s.code === r.service_code);
+                const cert = CERT_META[r.status] ?? { label: r.status, color: "#475569", bg: "#F1F5F9", icon: Clock };
                 const CertIcon = cert.icon;
                 return (
                   <tr
@@ -270,21 +302,23 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                     onClick={() => onOpenCase(r.id)}
                     className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer"
                   >
-                    <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{r.regNo}</td>
+                    <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">
+                      {r.certificate_no || r.reference_no}
+                    </td>
                     <td className="px-4 py-3 text-gray-800">
-                      {r.applicant}
-                      <span className="block font-mono text-[11px] text-gray-400">{r.id}</span>
+                      {r.subject_name || r.applicant}
+                      <span className="block font-mono text-[11px] text-gray-400">{r.reference_no}</span>
                     </td>
                     <td className="px-4 py-3">
                       <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
-                        {svc?.short}
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color ?? "#94A3B8" }} />
+                        {svc?.short_name || text(r.service_name) || r.service_code}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-gray-600">{r.province}</td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{eventDateOf(r)}</td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{r.registered}</td>
-                    <td className="px-4 py-3 text-gray-500">{r.officer ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-600">{r.jurisdiction?.province_name ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{r.event_date ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{registeredOn(r)}</td>
+                    <td className="px-4 py-3 text-gray-500">{r.assigned_officer ?? "—"}</td>
                     <td className="px-4 py-3">
                       <span
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap"
@@ -305,7 +339,32 @@ export function CivilRegistrationPage({ onOpenCase }: { onOpenCase: (id: string)
                   </tr>
                 );
               })}
-              {totalRows === 0 && (
+
+              {list.loading && (
+                <tr>
+                  <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">
+                    <Loader2 className="w-5 h-5 animate-spin mx-auto mb-2 text-gray-300" />
+                    Loading the register…
+                  </td>
+                </tr>
+              )}
+
+              {!list.loading && list.error && (
+                <tr>
+                  <td colSpan={9} className="px-5 py-12 text-center">
+                    <AlertTriangle className="w-6 h-6 text-red-300 mx-auto mb-2" />
+                    <p className="text-sm text-red-600 mb-3">{list.error.message}</p>
+                    <button
+                      onClick={list.refetch}
+                      className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                    >
+                      Retry
+                    </button>
+                  </td>
+                </tr>
+              )}
+
+              {!list.loading && !list.error && rows.length === 0 && (
                 <tr>
                   <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">
                     No register entries match your filters.

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Toaster } from "./components/ui/sonner";
+import { SessionProvider, useSession } from "./api/session";
 import { DashboardLayout } from "./components/DashboardLayout";
 import { OverviewPage } from "./pages/OverviewPage";
 import { ApplicationsPage } from "./pages/ApplicationsPage";
@@ -15,10 +16,18 @@ import { ReportsPage } from "./pages/ReportsPage";
 import { GisMapPage } from "./pages/GisMapPage";
 import { LoginPage } from "./pages/LoginPage";
 
-const AUTH_KEY = "lcc-authed";
-
 export default function App() {
-  const [authed, setAuthed] = useState(() => localStorage.getItem(AUTH_KEY) === "1");
+  return (
+    <SessionProvider>
+      <Shell />
+    </SessionProvider>
+  );
+}
+
+function Shell() {
+  // The session lives in the API layer, so a reload keeps the officer signed in
+  // and every request carries their token without the page knowing about it.
+  const session = useSession();
   const [activeTab, setActiveTab] = useState("overview");
   const [caseId, setCaseId] = useState<string | null>(null);
 
@@ -27,22 +36,29 @@ export default function App() {
     setActiveTab(tab);
   }
 
-  function handleLogin() {
-    localStorage.setItem(AUTH_KEY, "1");
-    setAuthed(true);
-  }
-
-  function handleSignOut() {
-    localStorage.removeItem(AUTH_KEY);
+  async function handleSignOut() {
+    await session.signOut();
     setCaseId(null);
     setActiveTab("overview");
-    setAuthed(false);
   }
 
-  if (!authed) {
+  // Exchanging a stored token for the profile takes a moment; showing the shell
+  // before it resolves would flash an empty sidebar and fire unauthorised calls.
+  if (session.loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+        <div className="flex items-center gap-3 text-slate-500">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-600" />
+          Signing you in...
+        </div>
+      </div>
+    );
+  }
+
+  if (!session.isAuthenticated) {
     return (
       <>
-        <LoginPage onSuccess={handleLogin} />
+        <LoginPage onSuccess={session.signIn} />
         <Toaster position="top-right" richColors />
       </>
     );

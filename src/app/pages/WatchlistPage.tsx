@@ -3,13 +3,15 @@ import {
   Search, ShieldAlert, ArrowLeft, MapPin,
   BadgeCheck, TriangleAlert, ScanSearch, ChevronRight,
 } from "lucide-react";
-import {
-  WATCHLIST, WATCH_BY_UIN, CITIZEN_BY_UIN, WATCHLIST_SUMMARY,
-  WATCH_CATEGORY_META, RISK_META, searchPeople,
-  type WatchlistEntry,
-} from "../data/watchlist";
-import { type Citizen } from "../data/population";
-import { PersonRecord, Chip } from "../components/PersonRecord";
+import { registry, verification } from "../api/endpoints";
+import { useDebounced, useQuery } from "../api/hooks";
+import { text, type WatchlistEntry } from "../api/types";
+import { PersonRecord, Chip, categoryMeta, riskMeta } from "../components/PersonRecord";
+
+interface SelectedPerson {
+  uin: string;
+  name: string;
+}
 
 function Kpi({
   icon: Icon, label, value, sub, tone,
@@ -34,20 +36,62 @@ function Kpi({
   );
 }
 
+function Retry({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="px-5 py-16 text-center">
+      <p className="text-sm text-gray-600">{message}</p>
+      <button
+        onClick={onRetry}
+        className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 export function WatchlistPage() {
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<Citizen | null>(null);
+  const [selected, setSelected] = useState<SelectedPerson | null>(null);
+  const [page, setPage] = useState(1);
 
-  const results = useMemo(() => searchPeople(query), [query]);
-  const activeEntries = useMemo(
-    () => WATCHLIST.filter((e) => e.status === "active").slice(0, 8),
-    [],
+  const search = useDebounced(query.trim());
+  const searching = search.length >= 2;
+
+  /* Header counters. */
+  const summaryQuery = useQuery((signal) => verification.watchlistSummary(signal), []);
+  const summary = summaryQuery.data;
+
+  /* The registry search — the API ranks an exact UIN and an exact name first. */
+  const peopleQuery = useQuery(
+    (signal) => registry.persons({ search, page, per_page: 50 }, signal),
+    [search, page],
+    { enabled: searching },
   );
 
-  function openEntry(entry: WatchlistEntry) {
-    const person = CITIZEN_BY_UIN[entry.uin];
-    if (person) setSelected(person);
-  }
+  /* Active notices matching the same search, so a result row can be flagged. */
+  const flaggedQuery = useQuery(
+    (signal) => verification.watchlist({ search, status: "active", per_page: 100 }, signal),
+    [search],
+    { enabled: searching },
+  );
+
+  /* Before searching: the most recent active notices. */
+  const noticesQuery = useQuery(
+    (signal) => verification.watchlist({ status: "active", per_page: 8 }, signal),
+    [],
+    { enabled: !searching },
+  );
+
+  const flagged = useMemo(() => {
+    const map: Record<string, WatchlistEntry> = {};
+    for (const entry of flaggedQuery.data?.data ?? []) map[entry.uin] = entry;
+    return map;
+  }, [flaggedQuery.data]);
+
+  const results = peopleQuery.data?.data ?? [];
+  const total = peopleQuery.data?.meta.total ?? 0;
+  const notices = noticesQuery.data?.data ?? [];
 
   if (selected) {
     return (
@@ -58,7 +102,7 @@ export function WatchlistPage() {
         >
           <ArrowLeft className="w-4 h-4" /> Back to search
         </button>
-        <PersonRecord person={selected} showWatchlist />
+        <PersonRecord uin={selected.uin} showWatchlist />
       </div>
     );
   }
@@ -75,10 +119,10 @@ export function WatchlistPage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <Kpi icon={ShieldAlert} label="Active notices" value={WATCHLIST_SUMMARY.active} sub="Currently enforceable" tone="#B91C1C" />
-        <Kpi icon={TriangleAlert} label="High risk" value={WATCHLIST_SUMMARY.highRisk} sub="Notify authority before processing" tone="#B45309" />
-        <Kpi icon={BadgeCheck} label="Cleared" value={WATCHLIST_SUMMARY.cleared} sub="Notice lifted" tone="#047857" />
-        <Kpi icon={ScanSearch} label="Total on file" value={WATCHLIST_SUMMARY.total} sub="Across all categories" tone="#3752AE" />
+        <Kpi icon={ShieldAlert} label="Active notices" value={summary?.active ?? 0} sub={summaryQuery.error ? summaryQuery.error.message : "Currently enforceable"} tone="#B91C1C" />
+        <Kpi icon={TriangleAlert} label="High risk" value={summary?.high_risk ?? 0} sub="Notify authority before processing" tone="#B45309" />
+        <Kpi icon={BadgeCheck} label="Cleared" value={summary?.cleared ?? 0} sub="Notice lifted" tone="#047857" />
+        <Kpi icon={ScanSearch} label="Total on file" value={summary?.total ?? 0} sub="Across all categories" tone="#3752AE" />
       </div>
 
       {/* Search */}
@@ -88,12 +132,12 @@ export function WatchlistPage() {
           <input
             autoFocus
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => { setQuery(e.target.value); setPage(1); }}
             placeholder="Type a name, UIN, family book number, or village…"
             className="flex-1 bg-transparent outline-none text-base text-gray-800 placeholder:text-gray-400"
           />
           {query && (
-            <button onClick={() => setQuery("")} className="text-sm text-gray-400 hover:text-gray-600">
+            <button onClick={() => { setQuery(""); setPage(1); }} className="text-sm text-gray-400 hover:text-gray-600">
               Clear
             </button>
           )}
@@ -104,61 +148,63 @@ export function WatchlistPage() {
       </div>
 
       {/* Results, or the active-notice shortlist before searching */}
-      {query.trim().length >= 2 ? (
+      {searching ? (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-gray-100">
             <h2 className="text-base font-semibold text-gray-800">
-              {results.length} result{results.length !== 1 ? "s" : ""} for “{query.trim()}”
+              {total.toLocaleString()} result{total !== 1 ? "s" : ""} for “{search}”
             </h2>
           </div>
-          <div className="divide-y divide-gray-50">
-            {results.map((p) => {
-              const entry = WATCH_BY_UIN[p.uin];
-              const flagged = entry?.status === "active";
-              return (
-                <button
-                  key={p.uin}
-                  onClick={() => setSelected(p)}
-                  className={`w-full text-left px-5 py-3.5 flex items-center gap-3 hover:bg-gray-50/60 ${
-                    flagged ? "bg-red-50/40" : ""
-                  }`}
-                >
-                  <span
-                    className={`w-10 h-10 rounded-full text-xs font-semibold flex items-center justify-center flex-shrink-0 ${
-                      flagged ? "bg-red-100 text-red-700" : "bg-[#3752AE]/10 text-[#3752AE]"
+          {peopleQuery.error ? (
+            <Retry message={peopleQuery.error.message} onRetry={peopleQuery.refetch} />
+          ) : peopleQuery.loading ? (
+            <p className="px-5 py-16 text-center text-sm text-gray-400">Searching the register…</p>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {results.map((p) => {
+                const entry = flagged[p.uin];
+                const isFlagged = entry?.status === "active";
+                const name = text(p.name);
+                const cat = entry ? categoryMeta(entry.category) : null;
+                return (
+                  <button
+                    key={p.id ?? p.uin}
+                    onClick={() => setSelected({ uin: p.uin, name })}
+                    className={`w-full text-left px-5 py-3.5 flex items-center gap-3 hover:bg-gray-50/60 ${
+                      isFlagged ? "bg-red-50/40" : ""
                     }`}
                   >
-                    {p.name.split(" ").map((s) => s[0]).join("").slice(0, 2)}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm font-medium text-gray-800">{p.name}</p>
-                      {flagged && (
-                        <Chip
-                          label={WATCH_CATEGORY_META[entry.category].label}
-                          color={WATCH_CATEGORY_META[entry.category].color}
-                          bg={WATCH_CATEGORY_META[entry.category].bg}
-                        />
-                      )}
+                    <span
+                      className={`w-10 h-10 rounded-full text-xs font-semibold flex items-center justify-center flex-shrink-0 ${
+                        isFlagged ? "bg-red-100 text-red-700" : "bg-[#3752AE]/10 text-[#3752AE]"
+                      }`}
+                    >
+                      {name.split(" ").map((s) => s[0]).join("").slice(0, 2)}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-medium text-gray-800">{name}</p>
+                        {isFlagged && cat && <Chip label={cat.label} color={cat.color} bg={cat.bg} />}
+                      </div>
+                      <p className="text-xs text-gray-400 font-mono">{p.uin}</p>
                     </div>
-                    <p className="text-xs text-gray-400 font-mono">{p.uin}</p>
-                  </div>
-                  <div className="hidden sm:block text-right flex-shrink-0">
-                    <p className="text-sm text-gray-600">{p.age} years · {p.gender === "male" ? "Male" : "Female"}</p>
-                    <p className="text-xs text-gray-400 flex items-center gap-1 justify-end">
-                      <MapPin className="w-3 h-3" /> {p.village}, {p.province}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />
-                </button>
-              );
-            })}
-            {results.length === 0 && (
-              <p className="px-5 py-16 text-center text-sm text-gray-400">
-                No person in the registry matches “{query.trim()}”.
-              </p>
-            )}
-          </div>
+                    <div className="hidden sm:block text-right flex-shrink-0">
+                      <p className="text-sm text-gray-600">{p.age} years · {p.gender === "male" ? "Male" : "Female"}</p>
+                      <p className="text-xs text-gray-400 flex items-center gap-1 justify-end">
+                        <MapPin className="w-3 h-3" /> {p.jurisdiction?.village_name ?? "—"}, {p.jurisdiction?.province_name ?? "—"}
+                      </p>
+                    </div>
+                    <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />
+                  </button>
+                );
+              })}
+              {results.length === 0 && (
+                <p className="px-5 py-16 text-center text-sm text-gray-400">
+                  No person in the registry matches “{search}”.
+                </p>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
@@ -166,35 +212,45 @@ export function WatchlistPage() {
             <h2 className="text-base font-semibold text-gray-800">Recent active notices</h2>
             <p className="text-sm text-gray-400">Open one directly, or search above for any citizen</p>
           </div>
-          <div className="divide-y divide-gray-50">
-            {activeEntries.map((e) => {
-              const person = CITIZEN_BY_UIN[e.uin];
-              const cat = WATCH_CATEGORY_META[e.category];
-              const risk = RISK_META[e.risk];
-              return (
-                <button
-                  key={e.id}
-                  onClick={() => openEntry(e)}
-                  className="w-full text-left px-5 py-3.5 flex items-center gap-3 hover:bg-gray-50/60"
-                >
-                  <span className="w-10 h-10 rounded-full bg-red-100 text-red-700 flex items-center justify-center flex-shrink-0">
-                    <ShieldAlert className="w-5 h-5" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm font-medium text-gray-800">{person?.name ?? e.uin}</p>
-                      <Chip label={cat.label} color={cat.color} bg={cat.bg} />
-                      <Chip label={risk.label} color={risk.color} bg={risk.bg} />
+          {noticesQuery.error ? (
+            <Retry message={noticesQuery.error.message} onRetry={noticesQuery.refetch} />
+          ) : noticesQuery.loading ? (
+            <p className="px-5 py-16 text-center text-sm text-gray-400">Loading notices…</p>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {notices.map((e) => {
+                const cat = categoryMeta(e.category);
+                const risk = riskMeta(e.risk);
+                return (
+                  <button
+                    key={e.id}
+                    onClick={() => setSelected({ uin: e.uin, name: e.name })}
+                    className="w-full text-left px-5 py-3.5 flex items-center gap-3 hover:bg-gray-50/60"
+                  >
+                    <span className="w-10 h-10 rounded-full bg-red-100 text-red-700 flex items-center justify-center flex-shrink-0">
+                      <ShieldAlert className="w-5 h-5" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-medium text-gray-800">{e.name || e.uin}</p>
+                        <Chip label={cat.label} color={cat.color} bg={cat.bg} />
+                        <Chip label={risk.label} color={risk.color} bg={risk.bg} />
+                      </div>
+                      <p className="text-xs text-gray-400">
+                        {e.offence} · {e.notice_no} · issued {e.issued_at}
+                      </p>
                     </div>
-                    <p className="text-xs text-gray-400">
-                      {e.offence} · {e.id} · issued {e.issued}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />
-                </button>
-              );
-            })}
-          </div>
+                    <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />
+                  </button>
+                );
+              })}
+              {notices.length === 0 && (
+                <p className="px-5 py-16 text-center text-sm text-gray-400">
+                  No active watchlist notices in your jurisdiction.
+                </p>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

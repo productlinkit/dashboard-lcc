@@ -1,11 +1,15 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
-  Search, Eye, Check, Undo2, AlertTriangle, Clock, Inbox, Timer, ArrowRight, Users,
+  Search, Eye, Check, Undo2, AlertTriangle, Clock, Inbox, Timer, ArrowRight, Users, Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { APPLICATIONS, lastActivityOf, daysAgo, type AppStatus, type Application } from "../data/mockData";
-import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
+import { catalog, workflow } from "../api/endpoints";
+import { useDebounced, useQuery } from "../api/hooks";
+import { ApiError } from "../api/client";
+import { text, type Bilingual, type CaseStatus, type QueueRow, type ReferenceItem } from "../api/types";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
+import { SignaturePad, type Signature } from "../components/SignaturePad";
+import { StampPad, type Stamp } from "../components/StampPad";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "../components/ui/dialog";
@@ -16,29 +20,28 @@ import { Textarea } from "../components/ui/textarea";
  * PRD §11.4 lifecycle that waits on an officer; a case flows left to right as it
  * is approved, and drops off the board when it registers or is returned.
  *
- * "Waiting" is time at the CURRENT stage (days since the case last moved), not
- * total age — using the `updated` field, so a case that just reached a registrar
- * doesn't read as weeks overdue.
+ * The board is served by /admin/cases/queue: one request per column, filtered
+ * server-side by status, service, search and the overdue flag. The waiting time
+ * and the urgency badge are the API's own (`days_waiting` / `urgency`), so the
+ * board agrees with the SLA the backend enforces.
  */
 interface Stage {
-  status: AppStatus;
+  status: CaseStatus;
   label: string;
   actor: string;
-  sla: number; // working-day target at this stage
+  sla: number; // working-day target at this stage, until the API states its own
   approveLabel: string;
-  next: AppStatus; // where an approved case goes
+  /** The transition this column's approve button asks the API to perform. */
+  action: string;
+  next: CaseStatus; // where an approved case goes
   accent: string;
 }
 
 const STAGES: Stage[] = [
-  { status: "submitted", label: "Village certification", actor: "Village Chief", sla: 3, approveLabel: "Certify", next: "certified", accent: "#1D4ED8" },
-  { status: "certified", label: "District intake", actor: "District Registrar", sla: 2, approveLabel: "Start review", next: "under-review", accent: "#0369A1" },
-  { status: "under-review", label: "Registrar decision", actor: "District Registrar", sla: 5, approveLabel: "Register & sign", next: "registered", accent: "#6D28D9" },
+  { status: "submitted", label: "Village certification", actor: "Village Chief", sla: 3, approveLabel: "Certify", action: "certify", next: "certified", accent: "#1D4ED8" },
+  { status: "certified", label: "District intake", actor: "District Registrar", sla: 2, approveLabel: "Start review", action: "receive", next: "under-review", accent: "#0369A1" },
+  { status: "under-review", label: "Registrar decision", actor: "District Registrar", sla: 5, approveLabel: "Register & sign", action: "register", next: "registered", accent: "#6D28D9" },
 ];
-
-const STAGE_BY_STATUS: Record<string, Stage> = Object.fromEntries(STAGES.map((s) => [s.status, s]));
-const QUEUE_STATUSES = new Set(STAGES.map((s) => s.status));
-const SERVICE_OPTIONS = SERVICES.map((s) => ({ value: s.id, label: s.label, color: s.color }));
 
 type Urgency = "overdue" | "due" | "ontrack";
 const URGENCY_META: Record<Urgency, { label: string; color: string; bg: string }> = {
@@ -47,11 +50,54 @@ const URGENCY_META: Record<Urgency, { label: string; color: string; bg: string }
   ontrack: { label: "On track", color: "#059669", bg: "#D1FAE5" },
 };
 
-function urgencyOf(waited: number, sla: number): Urgency {
-  if (waited > sla) return "overdue";
-  if (waited >= sla) return "due";
-  return "ontrack";
+/* ── Wire shapes the API sends that are wider than the shared types ────────── */
+
+type QueueCard = QueueRow & { urgency?: Urgency };
+
+interface StageBucket {
+  status: CaseStatus;
+  stage: string;
+  stage_owner: string;
+  sla_days: number;
+  total: number;
+  overdue: number;
+  due_today: number;
 }
+
+interface ServerQueueSummary {
+  stages?: StageBucket[];
+  awaiting?: number;
+  total?: number;
+  overdue?: number;
+  due_today?: number;
+}
+
+interface ServerAction {
+  action: string;
+  label: string;
+  to_status: CaseStatus;
+  needs_reason?: boolean;
+  needs_signature?: boolean;
+  needs_paid_fee?: boolean;
+  blocked?: boolean;
+  blocked_reason?: string;
+}
+
+/** The reference-list endpoint answers either a bare array or { items }. */
+function referenceItems(payload: unknown): ReferenceItem[] {
+  if (Array.isArray(payload)) return payload as ReferenceItem[];
+  const items = (payload as { items?: ReferenceItem[] } | null)?.items;
+  return Array.isArray(items) ? items : [];
+}
+
+const PER_COLUMN = 40;
+
+/* A negative move the officer has to justify. */
+const REASONED_ACTIONS: Record<string, { title: string; verb: string; blurb: string }> = {
+  return: { title: "Return for correction", verb: "Return case", blurb: "will go back to the village officer." },
+  reject: { title: "Reject case", verb: "Reject case", blurb: "will be closed as rejected." },
+  revoke: { title: "Revoke case", verb: "Revoke case", blurb: "will have its certificate revoked." },
+};
 
 function Kpi({
   icon: Icon, label, value, tone, sub,
@@ -73,78 +119,238 @@ function Kpi({
   );
 }
 
-interface Card {
-  app: Application;
-  stage: Stage;
-  waited: number;
-  urgency: Urgency;
-  justMoved: boolean;
-}
-
 export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => void }) {
   const [services, setServices] = useState<string[]>([]);
   const [query, setQuery] = useState("");
+  const search = useDebounced(query, 350);
   const [onlyOverdue, setOnlyOverdue] = useState(false);
+  const [limits, setLimits] = useState<Record<string, number>>({});
+  const [actioned, setActioned] = useState(0);
 
-  /* Session-local moves: a case's status after being actioned on the board.
-   * The mock data is constant, so decisions live here. */
-  const [moved, setMoved] = useState<Record<string, AppStatus>>({});
-  const [returnFor, setReturnFor] = useState<string | null>(null);
+  /* The move being taken: which case, which transition, what it still needs. */
+  const [pending, setPending] = useState<{ row: QueueCard; action: ServerAction } | null>(null);
+  const [reasonCode, setReasonCode] = useState("");
   const [reason, setReason] = useState("");
+  const [signOpen, setSignOpen] = useState(false);
+  const [stampOpen, setStampOpen] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
+  const signatureRef = useRef("");
+  // The pads call onApply and then onClose, so "was it applied?" has to survive
+  // the same tick — state would still be stale when onClose reads it.
+  const signatureHandled = useRef(false);
+  const stampHandled = useRef(false);
 
-  const effectiveStatus = (a: Application): AppStatus => moved[a.id] ?? a.status;
+  const serviceKey = services.join(",");
+  const filters = useMemo(
+    () => ({
+      service_code: services,
+      search: search.trim() || undefined,
+      overdue: onlyOverdue ? true : undefined,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [serviceKey, search, onlyOverdue],
+  );
 
-  /* Cases that started in a queue stage, bucketed by where they are now. */
-  const board = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const cards: Record<string, Card[]> = Object.fromEntries(STAGES.map((s) => [s.status, []]));
-    for (const app of APPLICATIONS) {
-      if (!QUEUE_STATUSES.has(app.status)) continue; // only ever-queued cases
-      const status = moved[app.id] ?? app.status;
-      const stage = STAGE_BY_STATUS[status];
-      if (!stage) continue; // moved off the board (registered / returned)
-      if (services.length && !services.includes(app.serviceId)) continue;
-      if (q && !`${app.id} ${app.applicant} ${app.province}`.toLowerCase().includes(q)) continue;
+  const serviceList = useQuery((signal) => catalog.services({ phase1: true }, signal), []);
+  const reasonCodes = useQuery((signal) => catalog.referenceList("reason-code", signal), []);
 
-      const justMoved = app.id in moved;
-      const waited = justMoved ? 0 : daysAgo(lastActivityOf(app));
-      const urgency = urgencyOf(waited, stage.sla);
-      if (onlyOverdue && urgency !== "overdue") continue;
-      cards[status].push({ app, stage, waited, urgency, justMoved });
-    }
-    // Worklist ordering: longest-waiting first.
-    for (const s of STAGES) cards[s.status].sort((a, b) => b.waited - a.waited);
-    return cards;
-  }, [moved, services, query, onlyOverdue]);
+  const summary = useQuery(
+    (signal) => workflow.queueSummary({ ...filters }, signal) as unknown as Promise<ServerQueueSummary>,
+    [serviceKey, search, onlyOverdue],
+  );
 
-  const all = STAGES.flatMap((s) => board[s.status]);
-  const overdue = all.filter((c) => c.urgency === "overdue").length;
-  const dueToday = all.filter((c) => c.urgency === "due").length;
-  const avgWait = all.length ? (all.reduce((sum, c) => sum + c.waited, 0) / all.length).toFixed(1) : "0";
-  const processed = Object.keys(moved).length;
+  /* One request per column: the status filter is a query parameter, not a
+   * client-side pass over a downloaded array. */
+  const colSubmitted = useQuery(
+    (signal) => workflow.queue({ ...filters, status: "submitted", page: 1, per_page: limits.submitted ?? PER_COLUMN, sort: "submitted" }, signal),
+    [serviceKey, search, onlyOverdue, limits.submitted],
+  );
+  const colCertified = useQuery(
+    (signal) => workflow.queue({ ...filters, status: "certified", page: 1, per_page: limits.certified ?? PER_COLUMN, sort: "submitted" }, signal),
+    [serviceKey, search, onlyOverdue, limits.certified],
+  );
+  const colReview = useQuery(
+    (signal) => workflow.queue({ ...filters, status: "under-review", page: 1, per_page: limits["under-review"] ?? PER_COLUMN, sort: "submitted" }, signal),
+    [serviceKey, search, onlyOverdue, limits["under-review"]],
+  );
 
-  function approve(card: Card) {
-    setMoved((prev) => ({ ...prev, [card.app.id]: card.stage.next }));
-    const advanced = card.stage.next !== "registered";
-    toast.success(`${card.app.id} ${card.stage.approveLabel.toLowerCase()}`, {
-      description: advanced
-        ? `Moved to ${STAGE_BY_STATUS[card.stage.next].label}.`
-        : "Registered and signed — off the queue.",
+  const columns = { submitted: colSubmitted, certified: colCertified, "under-review": colReview } as const;
+
+  function refetchAll() {
+    summary.refetch();
+    colSubmitted.refetch();
+    colCertified.refetch();
+    colReview.refetch();
+  }
+
+  const serviceOptions = useMemo(
+    () => (serviceList.data ?? []).map((s) => ({ value: s.code, label: text(s.name), color: s.color })),
+    [serviceList.data],
+  );
+  const reasonOptions = useMemo(() => referenceItems(reasonCodes.data), [reasonCodes.data]);
+
+  const buckets = summary.data?.stages ?? [];
+  const bucketOf = (status: string) => buckets.find((b) => b.status === status);
+  const awaiting = summary.data?.awaiting ?? summary.data?.total ?? 0;
+  const overdue = summary.data?.overdue ?? 0;
+  const dueToday = summary.data?.due_today ?? 0;
+
+  const loadedCards = STAGES.flatMap((s) => (columns[s.status as keyof typeof columns].data?.data ?? []) as QueueCard[]);
+  const avgWait = loadedCards.length
+    ? (loadedCards.reduce((sum, c) => sum + (c.days_waiting ?? 0), 0) / loadedCards.length).toFixed(1)
+    : "0";
+
+  /* ── Transitions ───────────────────────────────────────────────────────── */
+
+  function closeDialogs() {
+    setPending(null);
+    setReasonCode("");
+    setReason("");
+    setDialogError(null);
+    setSignOpen(false);
+    setStampOpen(false);
+    signatureRef.current = "";
+  }
+
+  function reportError(err: unknown, fallback: string) {
+    const apiErr = err instanceof ApiError ? err : null;
+    // A refused transition comes back 409 with a message worth reading.
+    const message = apiErr?.message ?? fallback;
+    setDialogError(message);
+    toast.error(apiErr?.status === 409 ? "That move is not allowed right now" : "Action failed", {
+      description: message,
     });
   }
 
-  function confirmReturn() {
-    const id = returnFor;
-    if (!id) return;
-    if (!reason.trim()) {
-      toast.error("A reason is required", { description: "PRD §11 requires a recorded note on every return." });
+  /** Ask the API what this role may do to this case, then open the right step. */
+  async function begin(row: QueueCard, wanted: string) {
+    setBusyId(row.id);
+    setDialogError(null);
+    try {
+      const res = (await workflow.actions(row.id)) as unknown as { actions?: ServerAction[] };
+      const available = res.actions ?? [];
+      const action = available.find((a) => a.action === wanted);
+      if (!action) {
+        toast.error("Not available to your role", {
+          description: available.length
+            ? `You may ${available.map((a) => a.action).join(", ")} on ${row.reference_no}.`
+            : `No action is open to you on ${row.reference_no}.`,
+        });
+        return;
+      }
+      if (action.blocked) {
+        toast.error(action.label, { description: action.blocked_reason ?? "This move is blocked on this case." });
+        return;
+      }
+      setPending({ row, action });
+      if (action.needs_reason) {
+        setReasonCode("");
+        setReason("");
+      } else if (action.needs_signature) {
+        signatureRef.current = "";
+        signatureHandled.current = false;
+        setSignOpen(true);
+      } else {
+        await submit(row, action, {});
+      }
+    } catch (err) {
+      reportError(err, "Could not read the available actions.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function submit(
+    row: QueueCard,
+    action: ServerAction,
+    body: { reason_code?: string; reason?: string; signature_data_url?: string; stamp_data_url?: string },
+  ) {
+    setBusyId(row.id);
+    try {
+      switch (action.action) {
+        case "certify":
+          await workflow.certify(row.id, body);
+          break;
+        case "receive":
+          await workflow.receive(row.id, body);
+          break;
+        case "register":
+          await workflow.register(row.id, body);
+          break;
+        case "issue":
+          await workflow.issue(row.id, body);
+          break;
+        case "return":
+          await workflow.returnCase(row.id, body);
+          break;
+        case "reject":
+          await workflow.reject(row.id, body);
+          break;
+        case "revoke":
+          await workflow.revoke(row.id, body);
+          break;
+        default:
+          throw new ApiError(400, "BAD_REQUEST", `Unknown action "${action.action}".`);
+      }
+      setActioned((n) => n + 1);
+      toast.success(`${row.reference_no} — ${action.label.toLowerCase()}`, {
+        description: `Now ${action.to_status.replace("-", " ")}.`,
+      });
+      closeDialogs();
+      refetchAll();
+    } catch (err) {
+      reportError(err, "The case could not be moved.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  function onSignature(sig: Signature) {
+    signatureHandled.current = true;
+    signatureRef.current = sig.dataUrl ?? sig.data;
+    setSignOpen(false);
+    if (!pending) return;
+    // Certification carries the village stamp alongside the signature; the
+    // stamp step is optional and closing it submits the signature alone.
+    if (pending.action.action === "certify") {
+      stampHandled.current = false;
+      setStampOpen(true);
       return;
     }
-    setMoved((prev) => ({ ...prev, [id]: "returned" }));
-    toast.success(`${id} returned for correction`, { description: reason.trim() });
-    setReturnFor(null);
-    setReason("");
+    void submit(pending.row, pending.action, { signature_data_url: signatureRef.current });
   }
+
+  function onStamp(stamp: Stamp) {
+    stampHandled.current = true;
+    setStampOpen(false);
+    if (!pending) return;
+    void submit(pending.row, pending.action, {
+      signature_data_url: signatureRef.current,
+      stamp_data_url: stamp.dataUrl ?? stamp.data,
+    });
+  }
+
+  function onStampClosed() {
+    setStampOpen(false);
+    if (stampHandled.current || !pending) return;
+    void submit(pending.row, pending.action, { signature_data_url: signatureRef.current });
+  }
+
+  function confirmReasoned() {
+    if (!pending) return;
+    if (!reasonCode) {
+      setDialogError("Choose a reason code — it is recorded against the case.");
+      return;
+    }
+    if (!reason.trim()) {
+      setDialogError("A written reason is required. PRD §11 records a note on every return.");
+      return;
+    }
+    void submit(pending.row, pending.action, { reason_code: reasonCode, reason: reason.trim() });
+  }
+
+  const reasoned = pending && pending.action.needs_reason ? REASONED_ACTIONS[pending.action.action] : undefined;
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -158,11 +364,23 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
 
       {/* KPIs */}
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
-        <Kpi icon={Inbox} label="Awaiting action" value={all.length} tone="#3752AE" sub="On the board now" />
-        <Kpi icon={AlertTriangle} label="Overdue" value={overdue} tone="#B91C1C" sub="Past the stage target" />
-        <Kpi icon={Clock} label="Due today" value={dueToday} tone="#B45309" sub="Target runs out today" />
-        <Kpi icon={Timer} label="Avg. wait" value={`${avgWait} d`} tone="#0F766E" sub={`${processed} actioned this session`} />
+        <Kpi icon={Inbox} label="Awaiting action" value={summary.loading ? "—" : awaiting} tone="#3752AE" sub="On the board now" />
+        <Kpi icon={AlertTriangle} label="Overdue" value={summary.loading ? "—" : overdue} tone="#B91C1C" sub="Past the stage target" />
+        <Kpi icon={Clock} label="Due today" value={summary.loading ? "—" : dueToday} tone="#B45309" sub="Target runs out today" />
+        <Kpi icon={Timer} label="Avg. wait" value={`${avgWait} d`} tone="#0F766E" sub={`${actioned} actioned this session`} />
       </div>
+
+      {summary.error && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm text-red-600">{summary.error.message}</p>
+          <button
+            onClick={() => refetchAll()}
+            className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm">
@@ -177,7 +395,7 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
             />
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <MultiSelectFilter label="Services" options={SERVICE_OPTIONS} selected={services} onChange={setServices} />
+            <MultiSelectFilter label="Services" options={serviceOptions} selected={services} onChange={setServices} />
             <button
               onClick={() => setOnlyOverdue(!onlyOverdue)}
               className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium ${
@@ -193,8 +411,14 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
       {/* Board */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {STAGES.map((stage, i) => {
-          const cards = board[stage.status];
-          const stageOverdue = cards.filter((c) => c.urgency === "overdue").length;
+          const column = columns[stage.status as keyof typeof columns];
+          const cards = (column.data?.data ?? []) as QueueCard[];
+          const bucket = bucketOf(stage.status);
+          const total = column.data?.meta.total ?? bucket?.total ?? 0;
+          const stageOverdue = bucket?.overdue ?? cards.filter((c) => c.urgency === "overdue").length;
+          const sla = bucket?.sla_days ?? stage.sla;
+          const actor = bucket?.stage_owner || stage.actor;
+          const stageLabel = bucket?.stage ? bucket.stage : stage.label;
           return (
             <div key={stage.status} className="bg-gray-50/70 rounded-2xl border border-gray-100 flex flex-col">
               {/* Column header */}
@@ -202,15 +426,15 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: stage.accent }} />
-                    <h2 className="text-sm font-semibold text-gray-800 truncate">{stage.label}</h2>
+                    <h2 className="text-sm font-semibold text-gray-800 truncate capitalize">{stageLabel}</h2>
                   </div>
                   <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-white text-gray-600 border border-gray-100 flex-shrink-0">
-                    {cards.length}
+                    {column.loading ? "…" : total}
                   </span>
                 </div>
                 <div className="flex items-center justify-between mt-1.5 text-[11px] text-gray-400">
                   <span className="flex items-center gap-1 truncate">
-                    <Users className="w-3 h-3 flex-shrink-0" /> {stage.actor} · SLA {stage.sla}d
+                    <Users className="w-3 h-3 flex-shrink-0" /> {actor} · SLA {sla}d
                   </span>
                   {stageOverdue > 0 && (
                     <span className="text-red-500 font-medium flex-shrink-0">{stageOverdue} overdue</span>
@@ -220,63 +444,88 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
 
               {/* Cards */}
               <div className="p-3 space-y-2.5 flex-1 min-h-[120px] max-h-[calc(100vh-360px)] overflow-y-auto">
-                {cards.map((card) => {
-                  const svc = SERVICE_BY_ID[card.app.serviceId];
-                  const u = URGENCY_META[card.urgency];
+                {column.loading && (
+                  <div className="flex flex-col items-center justify-center py-10 text-center">
+                    <Loader2 className="w-6 h-6 text-gray-300 mb-1.5 animate-spin" />
+                    <p className="text-xs text-gray-400">Loading cases…</p>
+                  </div>
+                )}
+
+                {!column.loading && column.error && (
+                  <div className="flex flex-col items-center justify-center py-10 text-center gap-2">
+                    <AlertTriangle className="w-6 h-6 text-red-300" />
+                    <p className="text-xs text-red-600 px-3">{column.error.message}</p>
+                    <button
+                      onClick={column.refetch}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+
+                {!column.loading && !column.error && cards.map((card) => {
+                  const urgency = (card.urgency ?? (card.days_overdue > 0 ? "overdue" : "ontrack")) as Urgency;
+                  const u = URGENCY_META[urgency] ?? URGENCY_META.ontrack;
+                  const svcColor = serviceOptions.find((o) => o.value === card.service_code)?.color ?? stage.accent;
+                  const busy = busyId === card.id;
                   return (
                     <div
-                      key={card.app.id}
+                      key={card.id}
                       className="bg-white rounded-xl border border-gray-100 shadow-sm p-3 hover:border-gray-200 transition-colors"
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <button onClick={() => onOpenCase(card.app.id)} className="text-left min-w-0 group">
+                        <button onClick={() => onOpenCase(card.id)} className="text-left min-w-0 group">
                           <p className="text-sm font-medium text-gray-800 truncate group-hover:text-[#3752AE]">
-                            {card.app.applicant}
+                            {card.applicant}
                           </p>
-                          <p className="font-mono text-[11px] text-gray-400">{card.app.id}</p>
+                          <p className="font-mono text-[11px] text-gray-400">{card.reference_no}</p>
                         </button>
                         <span
                           className="text-[10px] font-medium px-1.5 py-0.5 rounded-full whitespace-nowrap flex-shrink-0"
                           style={{ color: u.color, backgroundColor: u.bg }}
                         >
-                          {card.justMoved ? "Just moved" : u.label}
+                          {u.label}
                         </span>
                       </div>
 
                       <div className="flex items-center gap-2 mt-2 text-xs text-gray-500">
                         <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-                          <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: svc?.color }} />
-                          {svc?.short}
+                          <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: svcColor }} />
+                          {text(card.service_name as Bilingual) || card.service_code}
                         </span>
                         <span className="text-gray-300">·</span>
-                        <span className="truncate">{card.app.province}</span>
+                        <span className="truncate">{card.jurisdiction?.province_name ?? "—"}</span>
                       </div>
 
                       <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-50">
                         <span className="text-[11px] text-gray-500 whitespace-nowrap">
-                          {card.justMoved ? "moved now" : `${card.waited}d`}
-                          <span className="text-gray-300"> / {stage.sla}d</span>
+                          {card.days_waiting}d
+                          <span className="text-gray-300"> / {card.sla_days ?? sla}d</span>
                         </span>
                         <div className="flex items-center gap-1">
                           <button
-                            onClick={() => onOpenCase(card.app.id)}
+                            onClick={() => onOpenCase(card.id)}
                             title="Open case"
                             className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-600"
                           >
                             <Eye className="w-3.5 h-3.5" />
                           </button>
                           <button
-                            onClick={() => setReturnFor(card.app.id)}
+                            onClick={() => void begin(card, "return")}
+                            disabled={busy}
                             title="Return for correction"
-                            className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-orange-600 hover:bg-orange-50"
+                            className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-orange-600 hover:bg-orange-50 disabled:opacity-40"
                           >
                             <Undo2 className="w-3.5 h-3.5" />
                           </button>
                           <button
-                            onClick={() => approve(card)}
+                            onClick={() => void begin(card, stage.action)}
+                            disabled={busy}
                             title={stage.approveLabel}
-                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] whitespace-nowrap"
+                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] whitespace-nowrap disabled:opacity-50"
                           >
+                            {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
                             {stage.approveLabel}
                             {i < STAGES.length - 1 ? <ArrowRight className="w-3 h-3" /> : <Check className="w-3 h-3" />}
                           </button>
@@ -286,11 +535,20 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
                   );
                 })}
 
-                {cards.length === 0 && (
+                {!column.loading && !column.error && cards.length === 0 && (
                   <div className="flex flex-col items-center justify-center py-10 text-center">
                     <Check className="w-6 h-6 text-gray-300 mb-1.5" />
                     <p className="text-xs text-gray-400">Nothing waiting here</p>
                   </div>
+                )}
+
+                {!column.loading && !column.error && cards.length > 0 && cards.length < total && (
+                  <button
+                    onClick={() => setLimits((prev) => ({ ...prev, [stage.status]: cards.length + PER_COLUMN }))}
+                    className="w-full py-2 text-xs font-medium text-[#3752AE] hover:underline"
+                  >
+                    Load {Math.min(PER_COLUMN, total - cards.length)} more
+                  </button>
                 )}
               </div>
             </div>
@@ -300,41 +558,69 @@ export function ApprovalQueuePage({ onOpenCase }: { onOpenCase: (id: string) => 
 
       <p className="text-xs text-gray-400 px-1">
         Approving a case moves it to the next stage; the final stage registers and signs it, taking it off the board.
-        Decisions are kept for this session only.
+        Every move is recorded against the case by the registry.
       </p>
 
-      {/* Return-for-correction reason — PRD requires a recorded note. */}
-      <Dialog open={returnFor !== null} onOpenChange={(open) => !open && setReturnFor(null)}>
+      {/* Reason-backed moves — the API requires a code and a written note. */}
+      <Dialog open={!!reasoned} onOpenChange={(open) => !open && closeDialogs()}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Return for correction</DialogTitle>
+            <DialogTitle>{reasoned?.title ?? "Return for correction"}</DialogTitle>
             <DialogDescription>
-              {returnFor ? `Case ${returnFor} will go back to the village officer.` : ""}
+              {pending ? `Case ${pending.row.reference_no} ${reasoned?.blurb ?? ""}` : ""}
             </DialogDescription>
           </DialogHeader>
+
+          <select
+            value={reasonCode}
+            onChange={(e) => setReasonCode(e.target.value)}
+            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
+          >
+            <option value="">Select a reason code…</option>
+            {reasonOptions.map((r) => (
+              <option key={r.code} value={r.code}>
+                {text(r.label)}
+              </option>
+            ))}
+          </select>
+
           <Textarea
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             rows={4}
             placeholder="What needs to be corrected? This note is recorded in the case history."
           />
+
+          {dialogError && <p className="text-sm text-red-600">{dialogError}</p>}
+
           <div className="flex justify-end gap-2 pt-1">
             <button
-              onClick={() => setReturnFor(null)}
+              onClick={closeDialogs}
               className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
             >
               Cancel
             </button>
             <button
-              onClick={confirmReturn}
-              disabled={!reason.trim()}
+              onClick={confirmReasoned}
+              disabled={!reason.trim() || !reasonCode || busyId !== null}
               className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[#C2410C] text-white hover:bg-[#9A3412] disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              Return case
+              {reasoned?.verb ?? "Return case"}
             </button>
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Certify / register carry the officer's e-signature. */}
+      <SignaturePad
+        open={signOpen}
+        onClose={() => {
+          setSignOpen(false);
+          if (!signatureHandled.current) setPending(null);
+        }}
+        onApply={onSignature}
+      />
+      <StampPad open={stampOpen} onClose={onStampClosed} onApply={onStamp} />
     </div>
   );
 }

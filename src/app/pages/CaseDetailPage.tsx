@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { toPng } from "html-to-image";
 import { jsPDF } from "jspdf";
 import {
@@ -16,8 +16,6 @@ import {
   Hash,
   Clock,
   History,
-  Eye,
-  FileText,
   Download,
   Award,
   ShieldCheck,
@@ -25,9 +23,10 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  RefreshCw,
   Stamp as StampIcon,
 } from "lucide-react";
-import { SignaturePad, SignatureMark, type Signature } from "../components/SignaturePad";
+import { SignaturePad, SignatureMark, signatureDataUrl, type Signature } from "../components/SignaturePad";
 import { StampPad, StampMark, type Stamp } from "../components/StampPad";
 import { toast } from "sonner";
 import {
@@ -40,53 +39,63 @@ import {
 import { Textarea } from "../components/ui/textarea";
 import photo3x4 from "../../imports/photo3x4.png";
 import laoEmblem from "../../imports/logo-lao-people-democratic.png";
-import {
-  APPLICATIONS,
-  PIPELINE_ORDER,
-  STATUS_META,
-  type AppStatus,
-  type Application,
-} from "../data/mockData";
-import {
-  SERVICE_FORMS,
-  REQUIREMENT_META,
-  type FieldDef,
-  type FormSection,
-  type FieldType,
-} from "../data/serviceForms";
+import { PIPELINE_ORDER, STATUS_META, type AppStatus } from "../data/mockData";
+import { REQUIREMENT_META } from "../data/serviceForms";
 import { SERVICE_BY_ID } from "../serviceConfig";
 import { StatusBadge } from "../components/StatusBadge";
+import { applications, catalog, workflow, type TransitionBody } from "../api/endpoints";
+import { useMutation, useQuery } from "../api/hooks";
+import {
+  text,
+  type ApplicationDetail,
+  type Attachment,
+  type CaseEvent,
+  type FieldRequirement,
+  type FormField,
+  type FormSection,
+  type Jurisdiction,
+} from "../api/types";
 
-/* Allowed status transitions (village → district workflow). */
+/* ── Workflow actions ──
+ * The buttons come from /admin/cases/{id}/actions, so the caller only ever sees
+ * a transition their role may actually perform. Tone and icon are presentation
+ * only, keyed by the action name. */
 type Tone = "primary" | "neutral" | "danger";
-interface Transition {
-  to: AppStatus;
+
+interface AllowedActionRow {
+  action: string;
   label: string;
-  tone: Tone;
-  icon: React.ComponentType<{ className?: string }>;
+  to_status: AppStatus;
+  needs_reason?: boolean;
+  needs_signature?: boolean;
+  needs_paid_fee?: boolean;
+  blocked?: boolean;
+  block_reason?: string;
 }
-const TRANSITIONS: Record<AppStatus, Transition[]> = {
-  draft: [{ to: "submitted", label: "Submit", tone: "primary", icon: Send }],
-  submitted: [
-    { to: "certified", label: "Certify (village)", tone: "primary", icon: BadgeCheck },
-    { to: "returned", label: "Return for correction", tone: "neutral", icon: CornerUpLeft },
-    { to: "rejected", label: "Reject", tone: "danger", icon: X },
-  ],
-  certified: [
-    { to: "under-review", label: "Send to district review", tone: "primary", icon: Send },
-    { to: "returned", label: "Return for correction", tone: "neutral", icon: CornerUpLeft },
-    { to: "rejected", label: "Reject", tone: "danger", icon: X },
-  ],
-  "under-review": [
-    { to: "registered", label: "Register & sign", tone: "primary", icon: FileSignature },
-    { to: "returned", label: "Return for correction", tone: "neutral", icon: CornerUpLeft },
-    { to: "rejected", label: "Reject", tone: "danger", icon: X },
-  ],
-  returned: [{ to: "submitted", label: "Re-submit", tone: "primary", icon: Send }],
-  registered: [{ to: "issued", label: "Issue certificate", tone: "primary", icon: Check }],
-  issued: [{ to: "revoked", label: "Revoke / cancel", tone: "danger", icon: Ban }],
-  rejected: [],
-  revoked: [],
+
+const ACTION_STYLE: Record<string, { tone: Tone; icon: React.ComponentType<{ className?: string }> }> = {
+  submit: { tone: "primary", icon: Send },
+  resubmit: { tone: "primary", icon: Send },
+  certify: { tone: "primary", icon: BadgeCheck },
+  receive: { tone: "primary", icon: Send },
+  register: { tone: "primary", icon: FileSignature },
+  issue: { tone: "primary", icon: Check },
+  return: { tone: "neutral", icon: CornerUpLeft },
+  reject: { tone: "danger", icon: X },
+  revoke: { tone: "danger", icon: Ban },
+  cancel: { tone: "danger", icon: Ban },
+};
+
+/* Transitions the back office owns. Submit / re-submit / cancel a draft belong
+ * to the applicant in the citizen app, so they are shown but not pressable. */
+const ACTION_ENDPOINT: Record<string, (id: string, body: TransitionBody) => Promise<ApplicationDetail>> = {
+  certify: (id, body) => workflow.certify(id, body),
+  receive: (id, body) => workflow.receive(id, body),
+  register: (id, body) => workflow.register(id, body),
+  issue: (id, body) => workflow.issue(id, body),
+  return: (id, body) => workflow.returnCase(id, body),
+  reject: (id, body) => workflow.reject(id, body),
+  revoke: (id, body) => workflow.revoke(id, body),
 };
 
 const TONE_CLASS: Record<Tone, string> = {
@@ -95,139 +104,46 @@ const TONE_CLASS: Record<Tone, string> = {
   danger: "bg-red-50 text-red-700 hover:bg-red-100 border border-red-200",
 };
 
-interface HistoryEntry {
-  status: AppStatus;
-  at: string;
-  by: string;
-  note?: string;
+/* ── form_data addressing ──
+ * The API stores a field under "<section>.<field>", "<section>.<instance>.<field>"
+ * or, on older records, the bare field key. One resolver covers all three so a
+ * screen never has to know which seed wrote the case. */
+export function fieldKey(sectionKey: string, instance: string | null, key: string): string {
+  return instance ? `${sectionKey}.${instance}.${key}` : `${sectionKey}.${key}`;
 }
 
-/* Negative / auditable transitions that require a written reason (PRD §11.4). */
-const REQUIRES_REASON = new Set<AppStatus>(["returned", "rejected", "revoked"]);
-
-/* ── Deterministic demo values ── */
-function hash(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-function pick<T>(arr: T[], seed: string): T {
-  return arr[hash(seed) % arr.length];
+function candidateKeys(sectionKey: string, instance: string | null, key: string): string[] {
+  return instance
+    ? [`${sectionKey}.${instance}.${key}`, `${sectionKey}.${key}`, `${instance}.${key}`, key]
+    : [`${sectionKey}.${key}`, key];
 }
 
-const MALE_NAMES = ["Somchai Vongduang", "Bounthavy Detsana", "Khamla Sisavath", "Phout Inthavong", "Souksavanh Rattanavong"];
-const FEMALE_NAMES = ["Khampheng Keomany", "Vilaiphone Soukaloun", "Noy Phommachanh", "Latda Sayavong", "Manivanh Khounnavong"];
-const ANY_NAMES = [...MALE_NAMES, ...FEMALE_NAMES];
-const ETHNIC_GROUPS = ["Lao Loum", "Lao Theung", "Hmong", "Khmu", "Tai Dam"];
-const RELIGIONS = ["Buddhism", "Christianity", "Animism", "None"];
-const OCCUPATIONS = ["Farmer", "Teacher", "Trader", "Civil servant", "Nurse"];
-const EDUCATION = ["Primary", "Lower secondary", "Upper secondary", "Bachelor's degree"];
-const MARITAL = ["Single", "Married", "Widowed", "Divorced"];
-
-function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+function resolveKey(data: Record<string, unknown>, sectionKey: string, instance: string | null, key: string): string {
+  const candidates = candidateKeys(sectionKey, instance, key);
+  return candidates.find((c) => c in data) ?? candidates[0];
 }
 
-/** A realistic, deterministic value for a field on the review screen. */
-function demoValue(f: FieldDef, app: Application, ctx: string): string {
-  const seed = app.id + "|" + ctx + "|" + f.en;
-  const name = f.en.toLowerCase();
-  const isMother = /mother|wife/i.test(ctx);
-  const isFather = /father|husband/i.test(ctx);
-
-  if (f.type === "static") return "Family Law No. 44/NA, dated 14/06/2018";
-  if (f.type === "document") return `${slug(f.en)}.pdf`;
-  if (f.type === "image") return "photo-3x4.jpg";
-
-  // Header / reference numbers
-  if (/^(ref\. no\.|document no\.|family book no\.)/.test(name)) return app.id;
-  if (name.includes("uin")) return "LA-" + (hash(seed) % 9000000 + 1000000);
-  if (name.includes("census book") || name.includes("id card")) {
-    return `01-${hash(seed) % 90 + 10}-${hash(seed) % 9000 + 1000} · issued ${app.submitted}`;
-  }
-
-  // Names
-  if (/full name|citizen's name|holder's name|name and surname/.test(name)) {
-    if (isMother) return pick(FEMALE_NAMES, seed);
-    if (isFather) return pick(MALE_NAMES, seed);
-    if (/informant|witness/i.test(ctx)) return pick(ANY_NAMES, seed);
-    return app.applicant;
-  }
-  if (name.startsWith("witness")) return `${pick(ANY_NAMES, seed)} · 1-${hash(seed) % 9000 + 1000}`;
-
-  // Dates / time
-  if (name === "date" || name.startsWith("dated") || name.startsWith("date /") || name.startsWith("date of issue")) return app.submitted;
-  if (name.startsWith("date of birth")) {
-    const y = 1960 + (hash(seed) % 55);
-    const m = String((hash(seed) % 12) + 1).padStart(2, "0");
-    const d = String((hash(seed) % 28) + 1).padStart(2, "0");
-    return `${d}/${m}/${y}`;
-  }
-  if (name.startsWith("date of death") || name.startsWith("date of marriage") || name.startsWith("date of divorce")) return app.submitted;
-  if (f.type === "time") return ["06:45", "08:30", "14:10", "21:05"][hash(seed) % 4];
-
-  // Demographics
-  if (name === "gender") return isMother ? "Female" : isFather ? "Male" : pick(["Male", "Female"], seed);
-  if (name === "age") return String(20 + (hash(seed) % 45));
-  if (name === "nationality") return "Lao";
-  if (name === "ethnicity") return "Lao Loum";
-  if (name === "ethnic group") return pick(ETHNIC_GROUPS, seed);
-  if (name === "religion") return pick(RELIGIONS, seed);
-  if (name.startsWith("ethnicity /")) return `Lao Loum · Lao · ${pick(RELIGIONS, seed)}`;
-  if (name === "occupation") return pick(OCCUPATIONS, seed);
-  if (name.includes("education")) return pick(EDUCATION, seed);
-  if (name.includes("marital status")) return pick(MARITAL, seed);
-
-  // Addresses / places (lookups)
-  if (name.startsWith("province") || name.includes("/ province")) return app.province;
-  if (name.includes("address") || name.includes("place of") || name.includes("current village") || name === "village" || name.includes("native village")) {
-    return `Ban ${pick(["Nasai", "Dongdok", "Phonsavang", "Sikhai", "Thatluang"], seed)}, ${app.province}`;
-  }
-  if (name.includes("certifying district")) return app.province;
-  if (name.includes("place of registration")) return `DoHA Office, ${app.province}`;
-
-  // Household / location detail
-  if (name.startsWith("house no")) return String(hash(seed) % 400 + 1);
-  if (name.startsWith("group")) return "Khum " + ((hash(seed) % 6) + 1);
-  if (name.startsWith("unit")) return "Unit " + ((hash(seed) % 9) + 1);
-  if (name.startsWith("village chief")) return pick(MALE_NAMES, seed);
-  if (name.startsWith("total people")) return String(hash(seed) % 6 + 2);
-  if (name.startsWith("number of men")) return `${hash(seed) % 3 + 1} / ${hash(seed) % 3 + 1}`;
-
-  // Birth specifics
-  if (name.startsWith("weight")) return `${(hash(seed) % 20 + 25) / 10} kg / ${hash(seed) % 10 + 45} cm`;
-  if (name.startsWith("blood")) return pick(["O+", "A+", "B+", "AB+", "O-"], seed);
-  if (name.startsWith("fingerprint")) return "FP-" + (hash(seed) % 900000 + 100000);
-  if (name.startsWith("mode of delivery")) return pick(["Natural", "C-section"], seed);
-  if (name.startsWith("type of birth")) return pick(["Single", "Twins"], seed);
-  if (name.startsWith("co-delivered")) return "N/A (single birth)";
-
-  // Death specifics
-  if (name.startsWith("cause of death")) return pick(["Illness", "Accident", "Natural causes"], seed);
-
-  // Marriage / divorce
-  if (name.startsWith("divorce type")) return pick(["Voluntary", "Contested"], seed);
-  if (name.includes("residence certificate ref")) return "RC-2026-00" + (hash(seed) % 9000 + 1000);
-  if (name.includes("marriage certificate ref")) return "MC-2026-00" + (hash(seed) % 9000 + 1000);
-  if (name.includes("children") || name.includes("custody")) return "1 dependent — joint custody";
-
-  // Contact
-  if (name.startsWith("phone")) return "+856 20 " + (hash(seed) % 9000000 + 1000000);
-  if (name.startsWith("email")) return slug(app.applicant) + "@example.la";
-  if (name.startsWith("relationship")) return pick(["Spouse", "Child", "Parent", "Sibling"], seed);
-  if (name.startsWith("this certificate is used for")) return pick(["School enrolment", "Bank account", "Employment"], seed);
-
-  // Signatures / auto
-  if (f.type === "signature") return "E-signed · National CA";
-  if (f.type === "auto") return "Auto-generated";
-
-  return "—";
+function asText(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(v);
 }
 
-const TYPE_ICON: Partial<Record<FieldType, React.ComponentType<{ className?: string }>>> = {
+export function isEmptyValue(v: string | undefined): boolean {
+  return !v || v.trim() === "" || v.trim() === "—";
+}
+
+/** Swap a jurisdiction id for the name the case already carries. */
+function displayValue(raw: string, j: Jurisdiction | undefined): string {
+  if (!j || !raw) return raw;
+  if (raw === j.province_id) return j.province_name ?? raw;
+  if (raw === j.district_id) return j.district_name ?? raw;
+  if (raw === j.village_id) return j.village_name ?? raw;
+  return raw;
+}
+
+const TYPE_ICON: Partial<Record<string, React.ComponentType<{ className?: string }>>> = {
   image: ImageIcon,
   document: Paperclip,
   signature: PenLine,
@@ -235,14 +151,8 @@ const TYPE_ICON: Partial<Record<FieldType, React.ComponentType<{ className?: str
   time: Clock,
 };
 
-interface PreviewTarget {
-  title: string;
-  filename: string;
-  kind: "document" | "image";
-}
-
-function ReqChip({ req }: { req: FieldDef["req"] }) {
-  const m = REQUIREMENT_META[req];
+function ReqChip({ req }: { req: FieldRequirement }) {
+  const m = REQUIREMENT_META[req] ?? REQUIREMENT_META.optional;
   return (
     <span
       className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium uppercase tracking-wide"
@@ -253,27 +163,6 @@ function ReqChip({ req }: { req: FieldDef["req"] }) {
   );
 }
 
-/* ── Edit-mode helpers ── */
-export function fieldKey(sectionTitle: string, instance: string | null, en: string): string {
-  return `${sectionTitle}::${instance ?? ""}::${en}`;
-}
-
-export function isEmptyValue(v: string | undefined): boolean {
-  return !v || v.trim() === "" || v.trim() === "—";
-}
-
-function choiceOptions(en: string): string[] | null {
-  const n = en.toLowerCase();
-  if (n === "gender") return ["Male", "Female"];
-  if (n.includes("marital status")) return ["Single", "Married", "Widowed", "Divorced"];
-  if (n.startsWith("type of birth")) return ["Single", "Twins"];
-  if (n.startsWith("mode of delivery")) return ["Natural", "C-section"];
-  if (n.startsWith("cause of death")) return ["Illness", "Accident", "Suicide", "Homicide", "Other"];
-  if (n.startsWith("divorce type")) return ["Voluntary", "Contested"];
-  if (n.startsWith("relationship to household")) return ["Spouse", "Child", "Parent", "Sibling", "Other"];
-  return null;
-}
-
 function FieldInput({
   f,
   value,
@@ -281,7 +170,7 @@ function FieldInput({
   warn,
   onChange,
 }: {
-  f: FieldDef;
+  f: FormField;
   value: string;
   invalid: boolean;
   warn: boolean;
@@ -299,7 +188,7 @@ function FieldInput({
     return (
       <div className="mt-1.5 flex items-center gap-2">
         <span className="text-sm text-gray-600 truncate">{value || "No file"}</span>
-        <button className="text-xs text-[#3752AE] hover:underline whitespace-nowrap">Upload</button>
+        <span className="text-xs text-gray-400 whitespace-nowrap">uploaded from the citizen app</span>
       </div>
     );
   }
@@ -307,14 +196,14 @@ function FieldInput({
     return <div className="mt-1.5 text-sm text-gray-400">{value} <span className="text-[10px]">(auto)</span></div>;
   }
 
-  const options = f.type === "choice" ? choiceOptions(f.en) : null;
-  if (options) {
+  const options = f.options ?? null;
+  if (options && options.length > 0) {
     return (
       <select value={value} onChange={(e) => onChange(e.target.value)} className={base}>
         <option value="">— Select —</option>
         {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
+          <option key={o.value} value={o.value}>
+            {text(o.label) || o.value}
           </option>
         ))}
       </select>
@@ -323,9 +212,10 @@ function FieldInput({
 
   return (
     <input
+      type={f.type === "date" ? "date" : f.type === "number" ? "number" : "text"}
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      placeholder={`Enter ${f.en.toLowerCase()}…`}
+      placeholder={`Enter ${text(f.label).toLowerCase()}…`}
       className={base}
     />
   );
@@ -334,22 +224,24 @@ function FieldInput({
 function FieldRow({
   f,
   value,
+  display,
+  attachment,
   editing,
   invalid,
   warn,
-  onPreview,
   onChange,
 }: {
-  f: FieldDef;
+  f: FormField;
   value: string;
+  display: string;
+  attachment?: Attachment;
   editing: boolean;
   invalid: boolean;
   warn: boolean;
-  onPreview: (t: PreviewTarget) => void;
   onChange: (v: string) => void;
 }) {
   const Icon = TYPE_ICON[f.type];
-  const previewable = f.type === "document" || f.type === "image";
+  const fileLike = f.type === "document" || f.type === "image";
 
   return (
     <div className="py-3 border-b border-gray-50 last:border-0">
@@ -357,12 +249,12 @@ function FieldRow({
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             {Icon && <Icon className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />}
-            <span className="text-sm font-medium text-gray-800">{f.en}</span>
-            <span className="text-xs text-gray-400">{f.lo}</span>
+            <span className="text-sm font-medium text-gray-800">{text(f.label)}</span>
+            <span className="text-xs text-gray-400">{f.label?.lo}</span>
           </div>
-          {f.desc && <p className="text-xs text-gray-400 mt-0.5">{f.desc}</p>}
+          {f.description && <p className="text-xs text-gray-400 mt-0.5">{f.description}</p>}
         </div>
-        <ReqChip req={f.req} />
+        <ReqChip req={f.requirement} />
       </div>
 
       {editing ? (
@@ -375,18 +267,20 @@ function FieldRow({
         </>
       ) : (
         <div className="mt-1.5 text-sm">
-          {previewable ? (
-            <button
-              onClick={() => onPreview({ title: f.en, filename: value, kind: f.type as "document" | "image" })}
+          {fileLike && attachment ? (
+            <a
+              href={attachment.file_url}
+              target="_blank"
+              rel="noreferrer"
               className="inline-flex items-center gap-1.5 text-[#3752AE] hover:underline"
             >
-              <Eye className="w-3.5 h-3.5" />
-              {value}
-            </button>
-          ) : isEmptyValue(value) ? (
+              <Paperclip className="w-3.5 h-3.5" />
+              {attachment.file_name || attachment.label}
+            </a>
+          ) : isEmptyValue(display) ? (
             <span className="text-gray-300 italic">—</span>
           ) : (
-            <span className="text-gray-700">{value}</span>
+            <span className="text-gray-700">{display}</span>
           )}
         </div>
       )}
@@ -394,54 +288,64 @@ function FieldRow({
   );
 }
 
+interface RenderedField {
+  storeKey: string;
+  field: FormField;
+}
+
 function SectionCard({
   section,
-  values,
+  fieldsFor,
+  formData,
+  jurisdiction,
+  attachmentFor,
   editing,
   errorKeys,
   warnKeys,
-  onPreview,
   onChange,
 }: {
   section: FormSection;
-  values: Record<string, string>;
+  fieldsFor: (section: FormSection, instance: string | null) => RenderedField[];
+  formData: Record<string, unknown>;
+  jurisdiction: Jurisdiction | undefined;
+  attachmentFor: (field: FormField) => Attachment | undefined;
   editing: boolean;
   errorKeys: Set<string>;
   warnKeys: Set<string>;
-  onPreview: (t: PreviewTarget) => void;
   onChange: (key: string, v: string) => void;
 }) {
-  const instances = section.instances ?? [null];
+  const instances = section.instances && section.instances.length > 0 ? section.instances : [null];
   return (
     <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
       <div className="px-5 py-4 border-b border-gray-100">
         <h3 className="text-base font-semibold text-gray-800">
-          {section.title}
-          {section.laTitle && <span className="ml-2 text-sm font-normal text-gray-400">{section.laTitle}</span>}
+          {text(section.title)}
+          {section.title?.lo && <span className="ml-2 text-sm font-normal text-gray-400">{section.title.lo}</span>}
         </h3>
         {section.note && <p className="text-xs text-gray-400 mt-1">{section.note}</p>}
       </div>
       <div className="p-5 space-y-5">
         {instances.map((inst, i) => (
-          <div key={i}>
+          <div key={inst ?? i}>
             {inst && (
               <div className="mb-1 inline-flex items-center px-2.5 py-1 rounded-lg bg-gray-50 text-xs font-semibold text-gray-600">
                 {inst}
               </div>
             )}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
-              {section.fields.map((f) => {
-                const key = fieldKey(section.title, inst, f.en);
+              {fieldsFor(section, inst).map(({ storeKey, field }) => {
+                const raw = asText(formData[storeKey]);
                 return (
                   <FieldRow
-                    key={key}
-                    f={f}
-                    value={values[key] ?? ""}
+                    key={storeKey}
+                    f={field}
+                    value={raw}
+                    display={displayValue(raw, jurisdiction)}
+                    attachment={attachmentFor(field)}
                     editing={editing}
-                    invalid={errorKeys.has(key)}
-                    warn={warnKeys.has(key)}
-                    onPreview={onPreview}
-                    onChange={(v) => onChange(key, v)}
+                    invalid={errorKeys.has(storeKey)}
+                    warn={warnKeys.has(storeKey)}
+                    onChange={(v) => onChange(storeKey, v)}
                   />
                 );
               })}
@@ -486,55 +390,16 @@ function Pipeline({ status }: { status: AppStatus }) {
   );
 }
 
-function PreviewDialog({ target, onClose }: { target: PreviewTarget | null; onClose: () => void }) {
-  return (
-    <Dialog open={!!target} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            {target?.kind === "image" ? <ImageIcon className="w-4 h-4" /> : <FileText className="w-4 h-4" />}
-            {target?.title}
-          </DialogTitle>
-        </DialogHeader>
-
-        {target?.kind === "image" ? (
-          <div className="rounded-xl border border-gray-200 bg-gray-50 p-3 flex justify-center">
-            <img
-              src={photo3x4}
-              alt="3×4 photograph"
-              className="rounded-lg object-cover aspect-[3/4] max-h-80 w-auto shadow-sm"
-            />
-          </div>
-        ) : (
-          <div className="rounded-xl border border-gray-200 bg-white p-6 shadow-inner">
-            <div className="flex items-center gap-2 text-gray-700 mb-4">
-              <FileText className="w-5 h-5 text-[#3752AE]" />
-              <span className="font-medium text-sm">{target?.title}</span>
-            </div>
-            <div className="space-y-2">
-              <div className="h-2.5 rounded bg-gray-100 w-3/4" />
-              <div className="h-2.5 rounded bg-gray-100 w-full" />
-              <div className="h-2.5 rounded bg-gray-100 w-5/6" />
-              <div className="h-2.5 rounded bg-gray-100 w-2/3" />
-              <div className="h-20 rounded bg-gray-50 border border-dashed border-gray-200 mt-4 flex items-center justify-center text-xs text-gray-400">
-                Document preview
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="flex items-center justify-between mt-2">
-          <span className="text-xs text-gray-400 font-mono">{target?.filename}</span>
-          <button className="inline-flex items-center gap-1.5 text-sm text-[#3752AE] hover:underline">
-            <Download className="w-4 h-4" /> Download
-          </button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
+/* ── Deterministic faux QR code (decorative, offline) ── */
+function hash(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
-/* ── Deterministic faux QR code (decorative, offline) ── */
 function QrCode({ value, size = 104 }: { value: string; size?: number }) {
   const n = 25; // modules per side
   const m = size / n;
@@ -587,20 +452,35 @@ function Emblem() {
   return <img src={laoEmblem} alt="Lao PDR emblem" className="w-16 h-16 object-contain" />;
 }
 
+/** The handful of case facts the certificate prints. */
+interface CertCase {
+  ref: string;
+  serviceCode: string;
+  serviceLabel: string;
+  serviceLaLabel: string;
+  color: string;
+  applicant: string;
+  province: string;
+  district: string;
+  village: string;
+  issuedOn: string;
+  officer: string;
+  certificateNo?: string;
+  verifyUrl: string;
+}
+
 /* Generic certificate kept for non-resident services. */
-function GenericCertificate({ app }: { app: Application }) {
-  const svc = SERVICE_BY_ID[app.serviceId];
-  const verifyUrl = `verify.gov.la/c/${app.id}`;
+function GenericCertificate({ c }: { c: CertCase }) {
   const rows: [string, string][] = [
-    [svc.id === "family-book" ? "Household head" : "Full name", app.applicant],
-    ["Jurisdiction", app.province],
-    ["Date of issue", app.submitted],
+    [c.serviceCode === "family-book" ? "Household head" : "Full name", c.applicant],
+    ["Jurisdiction", [c.village, c.district, c.province].filter(Boolean).join(" · ") || c.province],
+    ["Date of issue", c.issuedOn],
   ];
-  if (svc.id === "birth") rows.push(["UIN", "LA-" + (hash(app.id) % 9000000 + 1000000)]);
+  if (c.certificateNo) rows.push(["Certificate No.", c.certificateNo]);
 
   return (
     <div className="bg-white">
-      <div className="h-1.5" style={{ backgroundColor: svc.color }} />
+      <div className="h-1.5" style={{ backgroundColor: c.color }} />
       <div className="p-8">
         <div className="text-center">
           <p className="text-[11px] tracking-wide text-gray-500">ສາທາລະນະລັດ ປະຊາທິປະໄຕ ປະຊາຊົນລາວ</p>
@@ -609,16 +489,16 @@ function GenericCertificate({ app }: { app: Application }) {
           <p className="text-[10px] text-gray-400">Ministry of Home Affairs (MoHA)</p>
         </div>
         <div className="flex items-center justify-center my-5">
-          <span className="w-12 h-12 rounded-full flex items-center justify-center" style={{ backgroundColor: `${svc.color}1A` }}>
-            <Award className="w-6 h-6" style={{ color: svc.color } as React.CSSProperties} />
+          <span className="w-12 h-12 rounded-full flex items-center justify-center" style={{ backgroundColor: `${c.color}1A` }}>
+            <Award className="w-6 h-6" style={{ color: c.color } as React.CSSProperties} />
           </span>
         </div>
         <div className="text-center">
-          <h2 className="text-xl font-bold text-gray-800">{svc.label}</h2>
-          <p className="text-sm text-gray-400">{svc.laLabel}</p>
-          <p className="mt-1 text-xs font-mono text-gray-500">No. {app.id}</p>
+          <h2 className="text-xl font-bold text-gray-800">{c.serviceLabel}</h2>
+          <p className="text-sm text-gray-400">{c.serviceLaLabel}</p>
+          <p className="mt-1 text-xs font-mono text-gray-500">No. {c.ref}</p>
         </div>
-        <p className="text-center text-sm text-gray-600 mt-5 max-w-md mx-auto">{CERT_STATEMENT[svc.id]}</p>
+        <p className="text-center text-sm text-gray-600 mt-5 max-w-md mx-auto">{CERT_STATEMENT[c.serviceCode]}</p>
         <div className="mt-6 border border-gray-100 rounded-xl divide-y divide-gray-100">
           {rows.map(([k, val]) => (
             <div key={k} className="flex items-center justify-between px-4 py-2.5 text-sm">
@@ -630,20 +510,20 @@ function GenericCertificate({ app }: { app: Application }) {
         <div className="mt-7 flex items-end justify-between gap-6">
           <div className="flex items-center gap-3">
             <div className="border border-gray-200 rounded-lg p-1.5">
-              <QrCode value={verifyUrl} />
+              <QrCode value={c.verifyUrl} />
             </div>
             <div className="text-[11px] text-gray-400 leading-snug">
               <p className="font-medium text-gray-500">Scan to verify</p>
-              <p className="font-mono">{verifyUrl}</p>
+              <p className="font-mono">{c.verifyUrl}</p>
             </div>
           </div>
           <div className="text-right">
             <div className="inline-flex items-center gap-1.5 text-emerald-600 text-xs font-medium">
               <ShieldCheck className="w-4 h-4" /> Protected e-signature
             </div>
-            <p className="text-sm font-semibold text-gray-700 mt-1">{app.officer ?? "District Registrar"}</p>
+            <p className="text-sm font-semibold text-gray-700 mt-1">{c.officer || "District Registrar"}</p>
             <p className="text-[11px] text-gray-400">DoHA Registrar · National CA</p>
-            <p className="text-[11px] text-gray-400">Signed {app.submitted}</p>
+            <p className="text-[11px] text-gray-400">Signed {c.issuedOn}</p>
           </div>
         </div>
       </div>
@@ -751,17 +631,18 @@ function StampLayer({
   );
 }
 
-/* Resident Certificate — laid out to match the official RC form. */
+/* Resident Certificate — laid out to match the official RC form, filled from the
+ * case's own form_data. */
 function ResidentCertificate({
-  app,
-  values,
+  c,
+  get,
   signature,
   onSign,
   stamps,
   onStampsChange,
 }: {
-  app: Application;
-  values: Record<string, string>;
+  c: CertCase;
+  get: (key: string) => string;
   signature: Signature | null;
   onSign: () => void;
   stamps: Stamp[];
@@ -769,27 +650,26 @@ function ResidentCertificate({
 }) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const signatureRef = useRef<HTMLDivElement>(null);
-  const v = (section: string, en: string) => values[fieldKey(section, null, en)] ?? "";
-  const province = v("Header & jurisdiction", "Province") || app.province;
-  const district = v("Header & jurisdiction", "District");
-  const village = v("Header & jurisdiction", "Village's Name");
-  const ref = v("Header & jurisdiction", "Ref. No.") || app.id;
-  const chief = v("Certifying authority", "Village Chief's Name");
-  const citizen = v("Applicant identity", "Citizen's Name") || app.applicant;
-  const age = v("Applicant identity", "Age");
-  const occupation = v("Applicant identity", "Occupation");
-  const nationality = v("Applicant identity", "Nationality");
-  const currentVillage = v("Applicant identity", "Current Village");
-  const houseNo = v("Applicant identity", "House No.");
-  const censusNo = v("Household reference (from Family Book)", "Household Census Book No.");
-  const censusDate = v("Household reference (from Family Book)", "Date issued (census book)");
-  const censusDP = v("Household reference (from Family Book)", "Census District / Province");
-  const father = v("Parentage", "Is the child of Mr.");
-  const mother = v("Parentage", "Is the child of Mrs.");
-  const nativeVDP = v("Parentage", "Native Village / District / Province");
-  const purpose = v("Purpose & issuance", "This certificate is used for");
-  const issued = v("Purpose & issuance", "Date / Month / Year (issued)") || app.submitted;
-  const verifyUrl = `verify.gov.la/c/${ref}`;
+
+  const province = c.province;
+  const district = c.district;
+  const village = c.village;
+  const ref = get("ref_no") || c.ref;
+  const chief = get("village_chief_name");
+  const citizen = get("citizen_name") || c.applicant;
+  const age = get("age");
+  const occupation = get("occupation");
+  const nationality = get("nationality");
+  const currentVillage = get("current_village_id") || village;
+  const houseNo = get("house_no");
+  const censusNo = get("household_no");
+  const censusDate = get("household_issued_at");
+  const censusDP = get("household_district") || `${district} / ${province}`;
+  const father = get("father_name");
+  const mother = get("mother_name");
+  const nativeVDP = get("native_place");
+  const purpose = get("purpose");
+  const issued = get("issue_date") || c.issuedOn;
 
   return (
     <div className="bg-white">
@@ -842,7 +722,7 @@ function ResidentCertificate({
         {/* QR (left) + date & signature (right) */}
         <div className="mt-8 flex items-end justify-between">
           <div className="border border-gray-200 rounded p-1.5">
-            <QrCode value={verifyUrl} size={92} />
+            <QrCode value={c.verifyUrl} size={92} />
           </div>
           <div ref={signatureRef} className="text-center min-w-44">
             <p>ວັນທີ {issued}</p>
@@ -900,8 +780,8 @@ async function downloadCertificatePdf(el: HTMLElement, filename: string) {
 }
 
 function CertificateDialog({
-  app,
-  values,
+  c,
+  get,
   open,
   onClose,
   signature,
@@ -911,8 +791,8 @@ function CertificateDialog({
   submitted,
   onSubmit,
 }: {
-  app: Application;
-  values: Record<string, string>;
+  c: CertCase;
+  get: (key: string) => string;
   open: boolean;
   onClose: () => void;
   signature: Signature | null;
@@ -922,20 +802,19 @@ function CertificateDialog({
   submitted: boolean;
   onSubmit: () => void;
 }) {
-  const svc = SERVICE_BY_ID[app.serviceId];
   const [padOpen, setPadOpen] = useState(false);
   const [stampOpen, setStampOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const certRef = useRef<HTMLDivElement>(null);
-  const showSubmit = svc.id === "resident";
+  const showSubmit = c.serviceCode === "resident";
   const canSubmit = !submitted && (!showSubmit || !!signature);
 
   async function handleDownload() {
     if (!certRef.current) return;
     setGenerating(true);
     try {
-      await downloadCertificatePdf(certRef.current, `${app.id}.pdf`);
-      toast.success("Certificate downloaded", { description: `${app.id}.pdf` });
+      await downloadCertificatePdf(certRef.current, `${c.ref}.pdf`);
+      toast.success("Certificate downloaded", { description: `${c.ref}.pdf` });
     } catch {
       toast.error("Could not generate PDF");
     } finally {
@@ -948,21 +827,21 @@ function CertificateDialog({
       <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
         <DialogContent className="max-w-2xl p-0 overflow-hidden max-h-[92vh] overflow-y-auto">
           <DialogHeader className="sr-only">
-            <DialogTitle>{svc.label} certificate</DialogTitle>
+            <DialogTitle>{c.serviceLabel} certificate</DialogTitle>
           </DialogHeader>
 
           <div ref={certRef}>
-            {svc.id === "resident" ? (
+            {c.serviceCode === "resident" ? (
               <ResidentCertificate
-                app={app}
-                values={values}
+                c={c}
+                get={get}
                 signature={signature}
                 onSign={() => setPadOpen(true)}
                 stamps={stamps}
                 onStampsChange={onStampsChange}
               />
             ) : (
-              <GenericCertificate app={app} />
+              <GenericCertificate c={c} />
             )}
           </div>
 
@@ -1030,98 +909,154 @@ function CertificateDialog({
   );
 }
 
-/* Build the editable values map from the schema + demo values. When the case is
- * still being captured (draft) or sent back (returned), a couple of mandatory
- * fields are left blank to reflect an incomplete submission. */
-function buildInitialValues(app?: Application): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!app) return out;
-  const form = SERVICE_FORMS[app.serviceId];
-  if (!form) return out;
-  for (const section of form.sections) {
-    for (const inst of section.instances ?? [null]) {
-      for (const f of section.fields) {
-        out[fieldKey(section.title, inst, f.en)] = demoValue(f, app, inst ?? section.title);
-      }
-    }
-  }
-  // Simulate an incomplete capture for draft / returned cases.
-  if (app.status === "draft" || app.status === "returned") {
-    let cleared = 0;
-    for (let si = 1; si < form.sections.length && cleared < 2; si++) {
-      const section = form.sections[si];
-      for (const inst of section.instances ?? [null]) {
-        for (const f of section.fields) {
-          if (f.req === "mandatory") {
-            out[fieldKey(section.title, inst, f.en)] = "";
-            if (++cleared >= 2) break;
-          }
-        }
-        if (cleared >= 2) break;
-      }
-    }
-  }
-  return out;
-}
+/* ── Page ──────────────────────────────────────────────────────────────── */
 
 export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () => void }) {
-  const app = useMemo(() => APPLICATIONS.find((a) => a.id === caseId), [caseId]);
-  const [status, setStatus] = useState<AppStatus>(app?.status ?? "draft");
-  const [history, setHistory] = useState<HistoryEntry[]>(
-    app ? [{ status: app.status, at: app.submitted, by: app.officer ?? "Village Officer" }] : [],
+  const detailQuery = useQuery((signal) => applications.get(caseId, signal), [caseId]);
+  const detail = detailQuery.data;
+
+  const schemaQuery = useQuery(
+    (signal) => catalog.formSchema(detail!.service_code, signal),
+    [detail?.service_code],
+    { enabled: !!detail?.service_code },
   );
-  const [preview, setPreview] = useState<PreviewTarget | null>(null);
-  const [reasonFor, setReasonFor] = useState<Transition | null>(null);
+
+  const actionsQuery = useQuery((signal) => workflow.actions(caseId, signal), [caseId, detail?.status]);
+
+  // The case payload already carries its history; the standalone timeline
+  // endpoint is only asked for when it does not.
+  const timelineQuery = useQuery((signal) => applications.timeline(caseId, signal), [caseId], {
+    enabled: !!detail && !detail.timeline,
+  });
+  const events: CaseEvent[] = detail?.timeline ?? timelineQuery.data?.events ?? [];
+
+  const [formData, setFormData] = useState<Record<string, unknown>>({});
+  const [backup, setBackup] = useState<Record<string, unknown>>({});
+  const [editing, setEditing] = useState(false);
+  const [reasonFor, setReasonFor] = useState<AllowedActionRow | null>(null);
   const [reasonText, setReasonText] = useState("");
   const [certOpen, setCertOpen] = useState(false);
   const [certSubmitted, setCertSubmitted] = useState(false);
-  const [values, setValues] = useState<Record<string, string>>(() => buildInitialValues(app));
-  const [backup, setBackup] = useState<Record<string, string>>({});
-  const [editing, setEditing] = useState(false);
   const [signature, setSignature] = useState<Signature | null>(null);
   const [stamps, setStamps] = useState<Stamp[]>([]);
+  const [padOpen, setPadOpen] = useState(false);
+  const [running, setRunning] = useState<string | null>(null);
+
+  // The server is the source of truth for the form; a fresh case payload
+  // replaces whatever the screen was holding.
+  useEffect(() => {
+    if (detail) setFormData({ ...(detail.form_data ?? {}) });
+  }, [detail]);
+
+  const save = useMutation((body: { form_data: Record<string, unknown> }) => applications.update(caseId, body));
+
+  const schema = schemaQuery.data;
+
+  /* Which storage key each schema field maps to, resolved once per render. */
+  const fieldsFor = useMemo(
+    () => (section: FormSection, instance: string | null): RenderedField[] =>
+      (section.fields ?? []).map((field) => ({
+        storeKey: resolveKey(formData, section.key, instance, field.key),
+        field,
+      })),
+    [formData],
+  );
 
   const validation = useMemo(() => {
     const errorKeys = new Set<string>();
     const warnKeys = new Set<string>();
-    const form = app ? SERVICE_FORMS[app.serviceId] : undefined;
-    if (!form) return { errorKeys, warnKeys };
-    for (const section of form.sections) {
-      for (const inst of section.instances ?? [null]) {
-        for (const f of section.fields) {
-          const key = fieldKey(section.title, inst, f.en);
-          if (!isEmptyValue(values[key])) continue;
-          if (f.req === "mandatory") errorKeys.add(key);
-          else if (f.req === "conditional") warnKeys.add(key);
+    for (const section of schema?.sections ?? []) {
+      const instances = section.instances && section.instances.length > 0 ? section.instances : [null];
+      for (const inst of instances) {
+        for (const { storeKey, field } of fieldsFor(section, inst)) {
+          if (!isEmptyValue(asText(formData[storeKey]))) continue;
+          if (field.requirement === "mandatory") errorKeys.add(storeKey);
+          else if (field.requirement === "conditional") warnKeys.add(storeKey);
         }
       }
     }
     return { errorKeys, warnKeys };
-  }, [app, values]);
+  }, [schema, formData, fieldsFor]);
 
-  if (!app) {
+  /* Look a form value up by its bare field key, whatever prefix it was stored
+   * under — the certificate reads the case this way. */
+  const getValue = useMemo(
+    () => (key: string): string => {
+      const exact = Object.keys(formData).find((k) => k === key || k.endsWith(`.${key}`));
+      return exact ? asText(formData[exact]) : "";
+    },
+    [formData],
+  );
+
+  const attachmentFor = useMemo(
+    () => (field: FormField): Attachment | undefined =>
+      (detail?.attachments ?? []).find((a) => a.slot === field.key || a.label === text(field.label)),
+    [detail],
+  );
+
+  /* ── Loading / failure states ── */
+  if (detailQuery.loading) {
     return (
       <div className="max-w-screen-2xl mx-auto">
         <button onClick={onBack} className="inline-flex items-center gap-2 text-sm text-[#3752AE] hover:underline mb-4">
           <ArrowLeft className="w-4 h-4" /> Back to applications
         </button>
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-12 text-center text-gray-400">
-          Case <span className="font-mono">{caseId}</span> not found.
+          <span className="inline-flex items-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading case…
+          </span>
         </div>
       </div>
     );
   }
 
-  const svc = SERVICE_BY_ID[app.serviceId];
-  const form = SERVICE_FORMS[app.serviceId];
-  const transitions = TRANSITIONS[status];
+  if (detailQuery.error || !detail) {
+    return (
+      <div className="max-w-screen-2xl mx-auto">
+        <button onClick={onBack} className="inline-flex items-center gap-2 text-sm text-[#3752AE] hover:underline mb-4">
+          <ArrowLeft className="w-4 h-4" /> Back to applications
+        </button>
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-12 text-center">
+          <p className="text-sm text-red-600">
+            {detailQuery.error?.message ?? `Case ${caseId} not found.`}
+          </p>
+          <button
+            onClick={detailQuery.refetch}
+            className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+          >
+            <RefreshCw className="w-4 h-4" /> Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
 
+  const status = detail.status as AppStatus;
+  const svc = SERVICE_BY_ID[detail.service_code];
+  const serviceColor = svc?.color ?? "#3752AE";
+  const jurisdiction = detail.jurisdiction;
+  const actions = (actionsQuery.data?.actions ?? []) as unknown as AllowedActionRow[];
   const isEditable = status === "draft" || status === "returned";
-  // The resident certificate must be signed + submitted before it can be issued.
   const certReady = certSubmitted || status === "issued";
 
+  const cert: CertCase = {
+    ref: detail.reference_no,
+    serviceCode: detail.service_code,
+    serviceLabel: svc?.label ?? text(detail.service_name),
+    serviceLaLabel: svc?.laLabel ?? detail.service_name?.lo ?? "",
+    color: serviceColor,
+    applicant: detail.subject_name || detail.applicant,
+    province: jurisdiction?.province_name ?? "",
+    district: jurisdiction?.district_name ?? "",
+    village: jurisdiction?.village_name ?? "",
+    issuedOn: (detail.issued_at ?? detail.submitted_at ?? detail.created_at ?? "").slice(0, 10),
+    officer: detail.assigned_officer ?? "",
+    certificateNo: detail.certificate_no,
+    verifyUrl: `verify.gov.la/c/${detail.certificate_no ?? detail.reference_no}`,
+  };
+
   function submitCertificate() {
-    if (svc.id === "resident" && !signature) {
+    if (detail!.service_code === "resident" && !signature) {
       toast.error("Signature required", { description: "Sign the certificate before submitting." });
       return;
     }
@@ -1130,53 +1065,94 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
     toast.success("Certificate submitted", { description: "You can now issue the certificate." });
   }
 
-  function apply(to: AppStatus, label: string, note?: string) {
-    setStatus(to);
-    setEditing(false);
-    setHistory((h) => [...h, { status: to, at: "just now", by: "You (current officer)", note }]);
-    toast.success(`Case ${app!.id} → ${STATUS_META[to].label}`, { description: note ?? label });
+  function changeField(key: string, v: string) {
+    setFormData((p) => ({ ...p, [key]: v }));
   }
 
-  function onTransition(t: Transition) {
-    // Enforce mandatory fields before submitting / re-submitting (FR-1).
-    if (t.to === "submitted" && validation.errorKeys.size > 0) {
-      toast.error(`${validation.errorKeys.size} mandatory field(s) missing`, {
-        description: "Complete the required fields before submitting.",
+  function startEdit() {
+    setBackup({ ...formData });
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    setFormData(backup);
+    setEditing(false);
+  }
+
+  async function saveEdit() {
+    try {
+      await save.run({ form_data: formData });
+      setEditing(false);
+      toast.success("Case updated", { description: detail!.reference_no });
+      detailQuery.refetch();
+    } catch (err) {
+      toast.error("Could not save the case", { description: (err as Error).message });
+    }
+  }
+
+  async function runAction(a: AllowedActionRow, reason?: string) {
+    const call = ACTION_ENDPOINT[a.action];
+    if (!call) {
+      toast.error("Not available here", {
+        description: "This step belongs to the applicant in the citizen app.",
       });
-      setEditing(true);
       return;
     }
-    // A certificate must be signed + submitted before it can be issued.
-    if (t.to === "issued" && svc.id === "resident" && !certReady) {
+
+    const sigUrl = signatureDataUrl(signature);
+    if (a.needs_signature && !sigUrl) {
+      toast.error("Signature required", { description: "Sign before completing this step." });
+      setPadOpen(true);
+      return;
+    }
+
+    const body: TransitionBody = {};
+    if (reason) {
+      body.reason = reason;
+      body.note = reason;
+    }
+    if (sigUrl) body.signature_data_url = sigUrl;
+
+    setRunning(a.action);
+    try {
+      await call(caseId, body);
+      toast.success(`Case ${detail!.reference_no} → ${STATUS_META[a.to_status]?.label ?? a.to_status}`, {
+        description: reason ?? a.label,
+      });
+      detailQuery.refetch();
+      actionsQuery.refetch();
+    } catch (err) {
+      toast.error("The transition was refused", { description: (err as Error).message });
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  function onTransition(a: AllowedActionRow) {
+    if (a.blocked) {
+      toast.error("Blocked", { description: a.block_reason ?? "This step cannot run yet." });
+      return;
+    }
+    if (a.action === "issue" && detail!.service_code === "resident" && !certReady) {
       toast.error("Certificate not submitted", { description: "Sign and submit the certificate first." });
       setCertOpen(true);
       return;
     }
-    if (REQUIRES_REASON.has(t.to)) {
+    if (a.needs_reason) {
       setReasonText("");
-      setReasonFor(t);
+      setReasonFor(a);
     } else {
-      apply(t.to, t.label);
+      void runAction(a);
     }
-  }
-
-  function startEdit() {
-    setBackup({ ...values });
-    setEditing(true);
-  }
-  function cancelEdit() {
-    setValues(backup);
-    setEditing(false);
-  }
-  function changeField(key: string, v: string) {
-    setValues((p) => ({ ...p, [key]: v }));
   }
 
   function confirmReason() {
     if (!reasonFor || !reasonText.trim()) return;
-    apply(reasonFor.to, reasonFor.label, reasonText.trim());
+    const a = reasonFor;
+    const reason = reasonText.trim();
     setReasonFor(null);
     setReasonText("");
+    void runAction(a, reason);
   }
 
   return (
@@ -1190,21 +1166,25 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
           <div className="flex items-start gap-4">
             <span
               className="w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0"
-              style={{ backgroundColor: `${svc?.color}1A` }}
+              style={{ backgroundColor: `${serviceColor}1A` }}
             >
-              {svc && <svc.icon className="w-6 h-6" style={{ color: svc.color } as React.CSSProperties} />}
+              {svc && <svc.icon className="w-6 h-6" style={{ color: serviceColor } as React.CSSProperties} />}
             </span>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
-                <h2 className="text-lg font-semibold text-gray-800">{app.applicant}</h2>
+                <h2 className="text-lg font-semibold text-gray-800">{detail.applicant}</h2>
                 <StatusBadge status={status} showLao />
               </div>
               <p className="text-sm text-gray-500 mt-0.5">
-                <span className="font-mono">{app.id}</span> · {svc?.label}{" "}
-                <span className="text-gray-400">{svc?.laLabel}</span>
+                <span className="font-mono">{detail.reference_no}</span> · {svc?.label ?? text(detail.service_name)}{" "}
+                <span className="text-gray-400">{svc?.laLabel ?? detail.service_name?.lo}</span>
               </p>
               <p className="text-xs text-gray-400 mt-0.5">
-                {app.province} · Submitted {app.submitted} · Acting role: {STATUS_META[status].actingRole}
+                {[jurisdiction?.village_name, jurisdiction?.district_name, jurisdiction?.province_name]
+                  .filter(Boolean)
+                  .join(" · ")}{" "}
+                · Submitted {(detail.submitted_at ?? detail.created_at ?? "").slice(0, 10)} · Acting role:{" "}
+                {STATUS_META[status]?.actingRole}
               </p>
             </div>
           </div>
@@ -1220,7 +1200,7 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
         {/* Form sections */}
         <div className="lg:col-span-2 space-y-5">
           {/* Edit toolbar + validation summary (capture / return only) */}
-          {isEditable && form && (
+          {isEditable && schema && (
             <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
               <div className="flex items-center gap-2 text-sm">
                 {validation.errorKeys.size > 0 ? (
@@ -1241,15 +1221,18 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
                 <div className="flex items-center gap-2">
                   <button
                     onClick={cancelEdit}
-                    className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                    disabled={save.pending}
+                    className="px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50"
                   >
                     Cancel
                   </button>
                   <button
-                    onClick={() => setEditing(false)}
-                    className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+                    onClick={saveEdit}
+                    disabled={save.pending}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-50"
                   >
-                    Done editing
+                    {save.pending && <Loader2 className="w-4 h-4 animate-spin" />}
+                    {save.pending ? "Saving…" : "Done editing"}
                   </button>
                 </div>
               ) : (
@@ -1263,16 +1246,34 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
             </div>
           )}
 
-          {form ? (
-            form.sections.map((s) => (
+          {schemaQuery.loading ? (
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-8 text-center text-gray-400">
+              <span className="inline-flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" /> Loading the form…
+              </span>
+            </div>
+          ) : schemaQuery.error ? (
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-8 text-center">
+              <p className="text-sm text-red-600">{schemaQuery.error.message}</p>
+              <button
+                onClick={schemaQuery.refetch}
+                className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+              >
+                <RefreshCw className="w-4 h-4" /> Retry
+              </button>
+            </div>
+          ) : schema && schema.sections.length > 0 ? (
+            schema.sections.map((s) => (
               <SectionCard
-                key={s.title}
+                key={s.id ?? s.key}
                 section={s}
-                values={values}
+                fieldsFor={fieldsFor}
+                formData={formData}
+                jurisdiction={jurisdiction}
+                attachmentFor={attachmentFor}
                 editing={editing}
                 errorKeys={validation.errorKeys}
                 warnKeys={validation.warnKeys}
-                onPreview={setPreview}
                 onChange={changeField}
               />
             ))
@@ -1281,6 +1282,43 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
               No form schema for this service.
             </div>
           )}
+
+          {/* Attachments */}
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100">
+              <h3 className="text-base font-semibold text-gray-800 flex items-center gap-2">
+                <Paperclip className="w-4 h-4 text-gray-400" /> Attachments
+              </h3>
+            </div>
+            <div className="p-5">
+              {detail.attachments && detail.attachments.length > 0 ? (
+                <ul className="divide-y divide-gray-50">
+                  {detail.attachments.map((f) => (
+                    <li key={f.id} className="flex items-center justify-between gap-3 py-2.5">
+                      <a
+                        href={f.file_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-2 text-sm text-[#3752AE] hover:underline min-w-0"
+                      >
+                        {f.kind === "photo" || f.kind === "signature" ? (
+                          <ImageIcon className="w-3.5 h-3.5 flex-shrink-0" />
+                        ) : (
+                          <Paperclip className="w-3.5 h-3.5 flex-shrink-0" />
+                        )}
+                        <span className="truncate">{f.label || f.file_name}</span>
+                      </a>
+                      <span className="text-xs text-gray-400 whitespace-nowrap">
+                        {f.slot} · {(f.uploaded_at ?? "").slice(0, 10)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-gray-400 text-center py-4">No documents uploaded for this case.</p>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* Action panel + history */}
@@ -1300,20 +1338,45 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
               </button>
             )}
             <h3 className="text-sm font-semibold text-gray-800 mb-3">Actions</h3>
-            {transitions.length > 0 ? (
+            {actionsQuery.loading ? (
+              <p className="text-sm text-gray-400 inline-flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" /> Loading actions…
+              </p>
+            ) : actionsQuery.error ? (
+              <div>
+                <p className="text-sm text-red-600">{actionsQuery.error.message}</p>
+                <button
+                  onClick={actionsQuery.refetch}
+                  className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" /> Retry
+                </button>
+              </div>
+            ) : actions.length > 0 ? (
               <div className="space-y-2">
-                {transitions.map((t) => {
-                  const Icon = t.icon;
-                  const disabled = t.to === "issued" && svc.id === "resident" && !certReady;
+                {actions.map((a) => {
+                  const style = ACTION_STYLE[a.action] ?? { tone: "primary" as Tone, icon: Send };
+                  const Icon = style.icon;
+                  const unsupported = !ACTION_ENDPOINT[a.action];
+                  const disabled =
+                    !!running ||
+                    a.blocked ||
+                    unsupported ||
+                    (a.action === "issue" && detail.service_code === "resident" && !certReady);
                   return (
                     <button
-                      key={t.to}
-                      onClick={() => onTransition(t)}
+                      key={a.action}
+                      onClick={() => onTransition(a)}
                       disabled={disabled}
-                      className={`w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all ${TONE_CLASS[t.tone]} disabled:opacity-40 disabled:cursor-not-allowed`}
+                      title={
+                        unsupported
+                          ? "This step belongs to the applicant in the citizen app."
+                          : a.block_reason ?? a.label
+                      }
+                      className={`w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all ${TONE_CLASS[style.tone]} disabled:opacity-40 disabled:cursor-not-allowed`}
                     >
-                      <Icon className="w-4 h-4" />
-                      {t.label}
+                      {running === a.action ? <Loader2 className="w-4 h-4 animate-spin" /> : <Icon className="w-4 h-4" />}
+                      {a.label}
                     </button>
                   );
                 })}
@@ -1328,35 +1391,48 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
             <h3 className="text-sm font-semibold text-gray-800 mb-3 flex items-center gap-2">
               <History className="w-4 h-4 text-gray-400" /> Case history
             </h3>
-            <ol className="space-y-3">
-              {history.map((h, i) => {
-                const meta = STATUS_META[h.status];
-                return (
-                  <li key={i} className="flex items-start gap-3">
-                    <span className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" style={{ backgroundColor: meta.color }} />
-                    <div className="min-w-0">
-                      <p className="text-sm text-gray-700">{meta.label}</p>
-                      <p className="text-xs text-gray-400">
-                        {h.at} · {h.by}
-                      </p>
-                      {h.note && (
-                        <p className="mt-1 text-xs text-gray-600 bg-gray-50 border border-gray-100 rounded-lg px-2.5 py-1.5">
-                          “{h.note}”
+            {timelineQuery.loading ? (
+              <p className="text-sm text-gray-400 inline-flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" /> Loading history…
+              </p>
+            ) : events.length === 0 ? (
+              <p className="text-sm text-gray-400">
+                {timelineQuery.error ? timelineQuery.error.message : "No recorded activity yet."}
+              </p>
+            ) : (
+              <ol className="space-y-3">
+                {events.map((h) => {
+                  const meta = STATUS_META[h.to_status as AppStatus];
+                  return (
+                    <li key={h.id} className="flex items-start gap-3">
+                      <span
+                        className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
+                        style={{ backgroundColor: meta?.color ?? "#94A3B8" }}
+                      />
+                      <div className="min-w-0">
+                        <p className="text-sm text-gray-700">{meta?.label ?? text(h.status_label)}</p>
+                        <p className="text-xs text-gray-400">
+                          {(h.occurred_at ?? "").replace("T", " ").slice(0, 16)} ·{" "}
+                          {h.actor_name ?? h.actor_role ?? "System"}
                         </p>
-                      )}
-                    </div>
-                  </li>
-                );
-              })}
-            </ol>
+                        {h.note && (
+                          <p className="mt-1 text-xs text-gray-600 bg-gray-50 border border-gray-100 rounded-lg px-2.5 py-1.5">
+                            “{h.note}”
+                          </p>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
           </div>
         </div>
       </div>
 
-      <PreviewDialog target={preview} onClose={() => setPreview(null)} />
       <CertificateDialog
-        app={app}
-        values={values}
+        c={cert}
+        get={getValue}
         open={certOpen}
         onClose={() => setCertOpen(false)}
         signature={signature}
@@ -1366,6 +1442,9 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
         submitted={certSubmitted}
         onSubmit={submitCertificate}
       />
+
+      {/* A transition that needs a signature opens the pad directly. */}
+      <SignaturePad open={padOpen} onClose={() => setPadOpen(false)} onApply={setSignature} />
 
       {/* Reason-required dialog for Return / Reject / Revoke */}
       <Dialog open={!!reasonFor} onOpenChange={(o) => !o && setReasonFor(null)}>
@@ -1396,7 +1475,7 @@ export function CaseDetailPage({ caseId, onBack }: { caseId: string; onBack: () 
               onClick={confirmReason}
               disabled={!reasonText.trim()}
               className={`px-3.5 py-2 rounded-xl text-sm font-medium transition-all ${
-                reasonFor && reasonFor.tone === "danger"
+                reasonFor && (ACTION_STYLE[reasonFor.action]?.tone ?? "primary") === "danger"
                   ? "bg-red-600 text-white hover:bg-red-700"
                   : "bg-[#3752AE] text-white hover:bg-[#2c428b]"
               } disabled:opacity-40 disabled:cursor-not-allowed`}

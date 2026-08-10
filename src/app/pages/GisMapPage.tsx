@@ -3,13 +3,51 @@ import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, PieChart, Pie, Cell,
 } from "recharts";
 import { ChevronRight, MapPin, Users, Home, Briefcase, Globe, FileText, X } from "lucide-react";
-import { LaosMap } from "../components/LaosMap";
-import { areaStat, POPULATION_BY_PROVINCE } from "../data/population";
-import { APPLICATIONS } from "../data/mockData";
+import { LaosMap, mapProvinceRows, mapValues } from "../components/LaosMap";
+import { applications, registry } from "../api/endpoints";
+import { useQuery } from "../api/hooks";
+import type { AreaSummary, CaseStatus } from "../api/types";
 
 const MALE_COLOR = "#3752AE";
 const FEMALE_COLOR = "#EC4899";
 const tooltipStyle = { borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 };
+
+const PENDING_STATUSES: CaseStatus[] = ["draft", "submitted", "certified", "under-review", "returned"];
+const REGISTER_STATUSES: CaseStatus[] = ["registered", "issued", "revoked"];
+
+/** The area endpoint also reports the case volume recorded in the area. */
+type Area = AreaSummary & { id?: string; applications?: number };
+
+const EMPTY_AREA: Area = {
+  level: "country",
+  name: "Lao PDR",
+  population: 0,
+  households: 0,
+  male: 0,
+  female: 0,
+  working_age: 0,
+  minors: 0,
+  seniors: 0,
+  foreign: 0,
+  age_bands: [],
+  child_label: "",
+  children: [],
+};
+
+interface Selection {
+  provinceId: string | null;
+  province: string | null;
+  districtId: string | null;
+  district: string | null;
+  villageId: string | null;
+  village: string | null;
+}
+
+const NO_SELECTION: Selection = {
+  provinceId: null, province: null,
+  districtId: null, district: null,
+  villageId: null, village: null,
+};
 
 function Kpi({
   icon: Icon, label, value, sub, tone,
@@ -32,37 +70,86 @@ function Kpi({
 }
 
 export function GisMapPage() {
-  const [province, setProvince] = useState<string | null>(null);
-  const [district, setDistrict] = useState<string | null>(null);
-  const [village, setVillage] = useState<string | null>(null);
+  const [sel, setSel] = useState<Selection>(NO_SELECTION);
 
-  const area = useMemo(() => areaStat(province, district, village), [province, district, village]);
+  /* Choropleth values, per province, straight from the registry. */
+  const mapQuery = useQuery((signal) => registry.mapProvinces({ metric: "population" }, signal), []);
+  const mapRows = useMemo(() => mapProvinceRows(mapQuery.data), [mapQuery.data]);
+  const values = useMemo(() => mapValues(mapRows), [mapRows]);
 
-  /* Application activity is recorded at province level, so it follows the
-   * selected province (or the whole country when none is chosen). */
+  /* Country → province → district → village aggregates for the selected area. */
+  const areaQuery = useQuery(
+    (signal) =>
+      registry.area(
+        { province_id: sel.provinceId, district_id: sel.districtId, village_id: sel.villageId },
+        signal,
+      ),
+    [sel.provinceId, sel.districtId, sel.villageId],
+  );
+  const area = (areaQuery.data as Area | undefined) ?? EMPTY_AREA;
+
+  /* Case volume for the same province (cases are recorded at province level). */
+  const casesQuery = useQuery(
+    (signal) => applications.summary({ province_id: sel.provinceId }, signal),
+    [sel.provinceId],
+  );
+
   const appScope = useMemo(() => {
-    const rows = APPLICATIONS.filter((a) => !province || a.province === province);
+    const rows = casesQuery.data?.by_status ?? [];
+    const countOf = (row: { count?: number; total?: number }) => row.count ?? row.total ?? 0;
+    const sumOf = (statuses: CaseStatus[]) =>
+      rows.filter((r) => statuses.includes(r.status)).reduce((a, r) => a + countOf(r), 0);
     return {
-      total: rows.length,
-      issued: rows.filter((a) => a.status === "issued").length,
-      pending: rows.filter((a) => ["draft", "submitted", "certified", "under-review", "returned"].includes(a.status)).length,
-      inRegister: rows.filter((a) => ["registered", "issued", "revoked"].includes(a.status)).length,
+      total: casesQuery.data?.total ?? 0,
+      issued: sumOf(["issued"]),
+      pending: sumOf(PENDING_STATUSES),
+      inRegister: sumOf(REGISTER_STATUSES),
     };
-  }, [province]);
+  }, [casesQuery.data]);
 
-  function drillInto(name: string) {
-    if (area.level === "country") setProvince(name);
-    else if (area.level === "province") setDistrict(name);
-    else if (area.level === "district") setVillage(name);
+  /* The GeoJSON feature name of the selected province, so the map highlights it. */
+  const selectedGeoName = useMemo(() => {
+    if (!sel.provinceId) return null;
+    return mapRows.find((r) => r.province_id === sel.provinceId)?.geo_name ?? sel.province;
+  }, [mapRows, sel.provinceId, sel.province]);
+
+  function selectProvinceByGeoName(name: string | null) {
+    if (!name) {
+      setSel(NO_SELECTION);
+      return;
+    }
+    const row = mapRows.find((r) => r.geo_name === name || r.province === name);
+    setSel({
+      ...NO_SELECTION,
+      provinceId: row?.province_id ?? null,
+      province: row?.province ?? name,
+    });
+  }
+
+  function drillInto(child: { id?: string; name: string }) {
+    if (area.level === "country") {
+      setSel({ ...NO_SELECTION, provinceId: child.id ?? null, province: child.name });
+    } else if (area.level === "province") {
+      setSel({ ...sel, districtId: child.id ?? null, district: child.name, villageId: null, village: null });
+    } else if (area.level === "district") {
+      setSel({ ...sel, villageId: child.id ?? null, village: child.name });
+    }
   }
 
   // Breadcrumb steps — each jumps back to that level.
   const crumbs: { label: string; onClick: () => void }[] = [
-    { label: "Lao PDR", onClick: () => { setProvince(null); setDistrict(null); setVillage(null); } },
+    { label: "Lao PDR", onClick: () => setSel(NO_SELECTION) },
   ];
-  if (province) crumbs.push({ label: province, onClick: () => { setDistrict(null); setVillage(null); } });
-  if (district) crumbs.push({ label: district, onClick: () => setVillage(null) });
-  if (village) crumbs.push({ label: village, onClick: () => {} });
+  if (sel.province) {
+    crumbs.push({
+      label: sel.province,
+      onClick: () => setSel({ ...sel, districtId: null, district: null, villageId: null, village: null }),
+    });
+  }
+  if (sel.district) {
+    crumbs.push({ label: sel.district, onClick: () => setSel({ ...sel, villageId: null, village: null }) });
+  }
+  if (sel.village) crumbs.push({ label: sel.village, onClick: () => {} });
 
   const genderData = [
     { name: "Male", value: area.male, color: MALE_COLOR },
@@ -70,7 +157,7 @@ export function GisMapPage() {
   ];
   const maxChild = area.children[0]?.population ?? 1;
   const avgHousehold = area.households ? area.population / area.households : 0;
-  const workingPct = area.population ? Math.round((area.workingAge / area.population) * 100) : 0;
+  const workingPct = area.population ? Math.round((area.working_age / area.population) * 100) : 0;
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -83,9 +170,9 @@ export function GisMapPage() {
               Explore the registered population by location — drill from country to village.
             </p>
           </div>
-          {(province || district || village) && (
+          {(sel.province || sel.district || sel.village) && (
             <button
-              onClick={() => { setProvince(null); setDistrict(null); setVillage(null); }}
+              onClick={() => setSel(NO_SELECTION)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200 self-start"
             >
               <X className="w-4 h-4" /> Reset to country
@@ -119,15 +206,29 @@ export function GisMapPage() {
             <span className="text-xs text-gray-400">Click a province to drill in</span>
           </div>
           <div className="flex-1 min-h-0">
-            <LaosMap
-              fill
-              zoom={6}
-              showList={false}
-              values={POPULATION_BY_PROVINCE}
-              valueLabel="Population"
-              selected={province}
-              onSelect={(name) => { setProvince(name); setDistrict(null); setVillage(null); }}
-            />
+            {mapQuery.error ? (
+              <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
+                <p className="text-sm text-gray-600">{mapQuery.error.message}</p>
+                <button
+                  onClick={mapQuery.refetch}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : mapQuery.loading ? (
+              <div className="h-full flex items-center justify-center text-sm text-gray-400">Loading map…</div>
+            ) : (
+              <LaosMap
+                fill
+                zoom={6}
+                showList={false}
+                values={values}
+                valueLabel="Population"
+                selected={selectedGeoName}
+                onSelect={selectProvinceByGeoName}
+              />
+            )}
           </div>
         </div>
 
@@ -142,17 +243,29 @@ export function GisMapPage() {
               {area.population.toLocaleString()} people · {area.households.toLocaleString()} households
             </p>
           </div>
-          {area.children.length > 0 ? (
+          {areaQuery.error ? (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6 text-center">
+              <p className="text-sm text-gray-600">{areaQuery.error.message}</p>
+              <button
+                onClick={areaQuery.refetch}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+              >
+                Retry
+              </button>
+            </div>
+          ) : areaQuery.loading ? (
+            <div className="flex-1 flex items-center justify-center p-6 text-sm text-gray-400">Loading area…</div>
+          ) : area.children.length > 0 ? (
             <>
               <div className="px-4 py-2 flex items-center justify-between border-b border-gray-50">
-                <span className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">{area.childLabel}</span>
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">{area.child_label}</span>
                 <span className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Population</span>
               </div>
               <div className="flex-1 overflow-y-auto min-h-[180px]">
                 {area.children.map((c) => (
                   <button
-                    key={c.name}
-                    onClick={() => drillInto(c.name)}
+                    key={c.id ?? c.name}
+                    onClick={() => drillInto(c)}
                     className="w-full px-4 py-2.5 border-b border-gray-50 last:border-0 hover:bg-gray-50 text-left"
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -183,7 +296,7 @@ export function GisMapPage() {
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <Kpi icon={Users} label="Total population" value={area.population.toLocaleString()} sub={`${area.male.toLocaleString()} M · ${area.female.toLocaleString()} F`} tone="#3752AE" />
         <Kpi icon={Home} label="Households" value={area.households.toLocaleString()} sub={`Avg ${avgHousehold.toFixed(1)} per household`} tone="#10B981" />
-        <Kpi icon={Briefcase} label="Working age (15–64)" value={area.workingAge.toLocaleString()} sub={`${workingPct}% of population`} tone="#6D28D9" />
+        <Kpi icon={Briefcase} label="Working age (15–64)" value={area.working_age.toLocaleString()} sub={`${workingPct}% of population`} tone="#6D28D9" />
         <Kpi icon={Globe} label="Foreign residents" value={area.foreign.toLocaleString()} sub={area.population ? `${((area.foreign / area.population) * 100).toFixed(1)}% of population` : "—"} tone="#F59E0B" />
       </div>
 
@@ -193,17 +306,23 @@ export function GisMapPage() {
           <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {area.name}</h2>
           <p className="text-sm text-gray-400 mb-3">Registered population by age band</p>
           <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={area.ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
-                <CartesianGrid horizontal={false} stroke="#F1F5F9" />
-                <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
-                <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
-                <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
-                <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
-                <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
-              </BarChart>
-            </ResponsiveContainer>
+            {area.age_bands.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-sm text-gray-400">
+                {areaQuery.loading ? "Loading…" : "No population registered in this area."}
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={area.age_bands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
+                  <CartesianGrid horizontal={false} stroke="#F1F5F9" />
+                  <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                  <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
+                  <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
+                  <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
+                  <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -246,12 +365,17 @@ export function GisMapPage() {
               <FileText className="w-4 h-4 text-gray-400" /> Administrative activity
             </h2>
             <p className="text-sm text-gray-400">
-              {province
-                ? `Civil registration cases in ${province}`
+              {sel.province
+                ? `Civil registration cases in ${sel.province}`
                 : "Civil registration cases across Lao PDR"}
-              {(district || village) && " · recorded at province level"}
+              {(sel.district || sel.village) && " · recorded at province level"}
             </p>
           </div>
+          {casesQuery.error && (
+            <button onClick={casesQuery.refetch} className="text-sm font-medium text-red-600 hover:underline">
+              {casesQuery.error.message} · Retry
+            </button>
+          )}
         </div>
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-4">
           {[
@@ -261,7 +385,9 @@ export function GisMapPage() {
             { label: "In progress", value: appScope.pending, tone: "#B45309" },
           ].map((m) => (
             <div key={m.label} className="rounded-xl bg-gray-50 p-4">
-              <p className="text-2xl font-bold" style={{ color: m.tone }}>{m.value.toLocaleString()}</p>
+              <p className="text-2xl font-bold" style={{ color: m.tone }}>
+                {casesQuery.loading ? "—" : m.value.toLocaleString()}
+              </p>
               <p className="text-sm text-gray-500">{m.label}</p>
             </div>
           ))}

@@ -49,6 +49,40 @@ function presetRange(id: PresetId): DateRange {
   }
 }
 
+/**
+ * The range as the API reads it: `date_from` / `date_to`, both "YYYY-MM-DD",
+ * and both omitted when the side is open so the server does not narrow on it.
+ */
+export function dateParams(range: DateRange): { date_from?: string; date_to?: string } {
+  const params: { date_from?: string; date_to?: string } = {};
+  if (range.from) params.date_from = range.from;
+  if (range.to) params.date_to = range.to;
+  return params;
+}
+
+/** Whole days covered by a range, or 0 when either side is open. */
+export function rangeSpanDays(range: DateRange): number {
+  if (!range.from || !range.to) return 0;
+  const from = Date.parse(`${range.from}T00:00:00`);
+  const to = Date.parse(`${range.to}T00:00:00`);
+  if (Number.isNaN(from) || Number.isNaN(to)) return 0;
+  return Math.floor((to - from) / 86_400_000) + 1;
+}
+
+/**
+ * The window of equal length immediately before this one, for period-on-period
+ * comparison. An open-ended range has no comparable predecessor.
+ */
+export function previousPeriod(range: DateRange): DateRange {
+  const span = rangeSpanDays(range);
+  if (span <= 0) return ALL_TIME;
+  const from = new Date(`${range.from}T00:00:00`);
+  const to = new Date(`${range.from}T00:00:00`);
+  to.setDate(to.getDate() - 1);
+  from.setDate(from.getDate() - span);
+  return { from: fmt(from), to: fmt(to) };
+}
+
 export function DateRangeFilter({ onChange }: { onChange: (range: DateRange) => void }) {
   const [preset, setPreset] = useState<PresetId>("all");
   const [range, setRange] = useState<DateRange>(ALL_TIME);

@@ -5,39 +5,163 @@ import {
 } from "recharts";
 import {
   Search, Download, ChevronLeft, ChevronRight, Wallet, Banknote, TrendingUp,
-  CircleAlert, Receipt, RotateCcw, Save, QrCode, Landmark, Coins,
+  CircleAlert, Receipt, RotateCcw, Save, QrCode, Landmark, Coins, CreditCard,
+  CheckCircle2, Undo2, RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
+import { catalog, locations, payments, reports } from "../api/endpoints";
+import { useDebounced, useMutation, useQuery } from "../api/hooks";
+import { useSession } from "../api/session";
+import type { ApiError } from "../api/client";
 import {
-  TRANSACTIONS, DEFAULT_METHODS, DEFAULT_PRICING, KIND_LABEL, TX_STATUS_META,
-  METHOD_OPTIONS, TX_STATUS_OPTIONS, SERVICE_OPTIONS, METHOD_COLOR, serviceLabel, formatLakShort,
-  type Transaction, type PaymentMethod, type ServicePricing, type TxStatus,
-} from "../data/payments";
-import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
-import { PROVINCE_STATS } from "../data/mockData";
-import { calendarBuckets } from "../data/derive";
+  text,
+  type PaymentMethod, type RevenueBucket, type Service, type ServicePricing,
+  type Transaction, type TransactionSummary,
+} from "../api/types";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
-import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
+import { DateRangeFilter, dateParams, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
 import { Switch } from "../components/ui/switch";
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "../components/ui/dialog";
 
-const METHOD_ICON: Record<PaymentMethod["kind"], React.ComponentType<{ className?: string }>> = {
+/*
+ * Payments & Revenue.
+ *
+ * Every figure on this page comes from the payments API: the transaction list,
+ * the revenue summary, the per-method reconciliation and the two configuration
+ * lists. Filtering and paging are server-side — the browser never holds more
+ * than one page of receipts, so the totals in the header are the API's totals
+ * rather than a sum of what happens to be loaded.
+ */
+
+/* ── Wire shapes the shared types do not spell out in full ── */
+
+type TxRow = Transaction & {
+  time?: string;
+  method_kind?: string;
+  method_color?: string;
+  external_ref?: string;
+};
+
+type RevenueSummary = TransactionSummary & {
+  outstanding_lak?: number;
+  refunded_lak?: number;
+  paid_count?: number;
+};
+
+interface ReconciliationMethod {
+  method_code: string;
+  method_label?: { en: string; lo: string };
+  method_kind?: string;
+  settlement_account?: string;
+  fee_percent?: number;
+  color?: string;
+  collected_lak: number;
+  provider_fee_lak: number;
+  net_lak: number;
+  pending_lak?: number;
+  refunded_lak?: number;
+  count: number;
+  unreconciled_count?: number;
+  unreconciled_lak?: number;
+}
+
+interface ReconciliationPayload {
+  methods: ReconciliationMethod[];
+  totals?: {
+    collected_lak?: number;
+    provider_fee_lak?: number;
+    net_lak?: number;
+    count?: number;
+    unreconciled_count?: number;
+    unreconciled_lak?: number;
+  };
+}
+
+type PricingRow = ServicePricing & { id?: string; active?: boolean; effective_at?: string };
+
+type PriceField = "fee_lak" | "copy_fee_lak" | "late_fine_lak";
+
+const METHOD_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
   wallet: Wallet,
   bank: Landmark,
   qr: QrCode,
   cash: Coins,
 };
 
-const PROVINCE_OPTIONS = Object.keys(PROVINCE_STATS).map((p) => ({ value: p, label: p }));
+const FALLBACK_COLOR = "#3752AE";
+
+/* The API's own vocabulary — these strings go straight into the query. */
+const TX_STATUS_OPTIONS = [
+  { value: "paid", label: "Paid", color: "#047857" },
+  { value: "pending", label: "Pending", color: "#B45309" },
+  { value: "failed", label: "Failed", color: "#B91C1C" },
+  { value: "refunded", label: "Refunded", color: "#6D28D9" },
+];
+
+const KIND_OPTIONS = [
+  { value: "service-fee", label: "Service fee" },
+  { value: "certified-copy", label: "Certified copy" },
+  { value: "late-fine", label: "Late registration fine" },
+];
+
+const KIND_LABEL: Record<string, string> = Object.fromEntries(KIND_OPTIONS.map((k) => [k.value, k.label]));
+
+const STATUS_META: Record<string, { label: string; color: string; bg: string }> = {
+  paid: { label: "Paid", color: "#047857", bg: "#D1FAE5" },
+  pending: { label: "Pending", color: "#B45309", bg: "#FEF3C7" },
+  refunded: { label: "Refunded", color: "#6D28D9", bg: "#EDE9FE" },
+  failed: { label: "Failed", color: "#B91C1C", bg: "#FEE2E2" },
+};
 
 const TABS = [
   { id: "overview", label: "Revenue overview" },
   { id: "transactions", label: "Transactions" },
+  { id: "reconciliation", label: "Reconciliation" },
   { id: "settings", label: "Payment settings" },
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
 
 function lak(n: number): string {
-  return `${Math.round(n).toLocaleString("en-US")} LAK`;
+  return `${Math.round(n || 0).toLocaleString("en-US")} LAK`;
+}
+
+/** Axis-sized money, unchanged from the shared formatter. */
+function formatLakShort(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return String(Math.round(n || 0));
+}
+
+function downloadCsv(csv: string, name: string) {
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ── Shared loading / error / empty states, in the page's own card style ── */
+
+function CardMessage({ children }: { children: React.ReactNode }) {
+  return <p className="px-5 py-12 text-center text-sm text-gray-400">{children}</p>;
+}
+
+function ErrorState({ error, onRetry }: { error: ApiError; onRetry: () => void }) {
+  return (
+    <div className="px-5 py-10 text-center">
+      <p className="text-sm text-gray-600">{error.message}</p>
+      <button
+        onClick={onRetry}
+        className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+      >
+        <RefreshCw className="w-4 h-4" /> Retry
+      </button>
+    </div>
+  );
 }
 
 function Kpi({
@@ -63,8 +187,8 @@ function Kpi({
   );
 }
 
-function StatusChip({ status }: { status: TxStatus }) {
-  const m = TX_STATUS_META[status];
+function StatusChip({ status }: { status: string }) {
+  const m = STATUS_META[status] ?? { label: status, color: "#475569", bg: "#F1F5F9" };
   return (
     <span
       className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap"
@@ -76,163 +200,316 @@ function StatusChip({ status }: { status: TxStatus }) {
   );
 }
 
-function exportCsv(rows: Transaction[]) {
-  const header = ["Receipt", "Date", "Time", "Ref no", "Payer", "Service", "Type", "Method", "Amount (LAK)", "Status", "Cashier"];
-  const body = rows.map((t) => [
-    t.id, t.date, t.time, t.applicationId, t.payer,
-    SERVICE_BY_ID[t.serviceId]?.label ?? t.serviceId,
-    KIND_LABEL[t.kind],
-    DEFAULT_METHODS.find((m) => m.id === t.method)?.label ?? t.method,
-    String(t.amount), TX_STATUS_META[t.status].label, t.cashier,
-  ]);
-  const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
-  const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `transactions-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 export function PaymentsPage() {
+  const { can } = useSession();
+  const canManage = can("payments", "full");
+
   const [tab, setTab] = useState<Tab>("overview");
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
+  /* The API narrows on a single province_id, so the chip is single-select. */
   const [provinces, setProvinces] = useState<string[]>([]);
 
   // Transaction filters
   const [query, setQuery] = useState("");
+  const search = useDebounced(query, 350);
   const [services, setServices] = useState<string[]>([]);
-  const [methods, setMethods] = useState<string[]>([]);
+  const [methodCodes, setMethodCodes] = useState<string[]>([]);
   const [statuses, setStatuses] = useState<string[]>([]);
+  const [kinds, setKinds] = useState<string[]>([]);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
 
-  // Settings (edited locally; Save is a mock commit)
-  const [methodConfig, setMethodConfig] = useState<PaymentMethod[]>(DEFAULT_METHODS);
-  const [pricing, setPricing] = useState<ServicePricing[]>(DEFAULT_PRICING);
-  const [dirty, setDirty] = useState(false);
+  /* ── Filter options ── */
+  const provincesQuery = useQuery((signal) => locations.provinces(signal), []);
+  const servicesQuery = useQuery((signal) => catalog.services({ per_page: 100 }, signal), []);
+  const methodsQuery = useQuery((signal) => payments.methods(signal), []);
 
-  /* Date range and province drive every revenue figure on the overview, and the
-   * transaction list inherits both so the two tabs always agree. */
-  const inScope = useMemo(
-    () =>
-      TRANSACTIONS.filter(
-        (t) => inRange(t.date, dateRange) && (provinces.length === 0 || provinces.includes(t.province)),
-      ),
-    [dateRange, provinces],
+  const provinceOptions = useMemo(
+    () => (provincesQuery.data ?? []).map((p) => ({ value: p.id, label: text(p.name) })),
+    [provincesQuery.data],
+  );
+  const serviceList = useMemo<Service[]>(() => servicesQuery.data ?? [], [servicesQuery.data]);
+  const serviceByCode = useMemo(() => {
+    const map: Record<string, Service> = {};
+    for (const s of serviceList) map[s.code] = s;
+    return map;
+  }, [serviceList]);
+  const serviceOptions = useMemo(
+    () => serviceList.map((s) => ({ value: s.code, label: text(s.name), color: s.color })),
+    [serviceList],
+  );
+  const methodList = useMemo<PaymentMethod[]>(() => methodsQuery.data ?? [], [methodsQuery.data]);
+  const methodOptions = useMemo(
+    () => methodList.map((m) => ({ value: m.code, label: text(m.label), color: m.color })),
+    [methodList],
   );
 
-  const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return inScope.filter((t) => {
-      if (services.length && !services.includes(t.serviceId)) return false;
-      if (methods.length && !methods.includes(t.method)) return false;
-      if (statuses.length && !statuses.includes(t.status)) return false;
-      if (q && !`${t.id} ${t.applicationId} ${t.payer} ${t.province}`.toLowerCase().includes(q)) return false;
-      return true;
+  /* ── Query parameters ──
+   * `scope` (date + province) drives the overview and the reconciliation, and
+   * the transaction list inherits it, so the tabs always agree on the period. */
+  const scope = useMemo(
+    () => ({ ...dateParams(dateRange), province_id: provinces[0] }),
+    [dateRange, provinces],
+  );
+  const scopeKey = JSON.stringify(scope);
+
+  const listFilters = useMemo(
+    () => ({
+      ...scope,
+      search: search.trim() || undefined,
+      service_code: services.length ? services : undefined,
+      method_code: methodCodes.length ? methodCodes : undefined,
+      status: statuses.length ? statuses : undefined,
+      kind: kinds.length ? kinds : undefined,
+      sort: "-paid_at",
+    }),
+    [scope, search, services, methodCodes, statuses, kinds],
+  );
+  const listKey = JSON.stringify(listFilters);
+
+  useEffect(() => setPage(1), [listKey, pageSize]);
+
+  /* ── Data ── */
+  const summaryQuery = useQuery(
+    (signal) => payments.summary(scope, signal) as Promise<RevenueSummary>,
+    [scopeKey],
+  );
+  /* Outstanding per service is a separate cut of the same ledger. */
+  const pendingQuery = useQuery(
+    (signal) => payments.summary({ ...scope, status: "pending" }, signal) as Promise<RevenueSummary>,
+    [scopeKey],
+  );
+  /* The province breakdown lives on the revenue report; payments summarises by
+   * status, method, service and day only. */
+  const provinceQuery = useQuery(
+    (signal) => reports.revenue(scope, signal) as Promise<{ by_province?: RevenueBucket[] }>,
+    [scopeKey],
+    { enabled: tab === "overview" },
+  );
+
+  const txQuery = useQuery(
+    (signal) => payments.transactions({ ...listFilters, page, per_page: pageSize }, signal),
+    [listKey, page, pageSize],
+    { enabled: tab === "transactions" },
+  );
+  const txSummaryQuery = useQuery(
+    (signal) => payments.summary(listFilters, signal) as Promise<RevenueSummary>,
+    [listKey],
+    { enabled: tab === "transactions" },
+  );
+
+  const reconQuery = useQuery(
+    async (signal) => (await payments.reconciliation(scope, signal)) as unknown as ReconciliationPayload,
+    [scopeKey],
+    { enabled: tab === "reconciliation" },
+  );
+
+  const pricingQuery = useQuery(
+    async (signal) => (await payments.pricing(signal)) as PricingRow[],
+    [],
+    { enabled: tab === "settings" },
+  );
+
+  /* ── Settings, edited locally then committed row by row ── */
+  const [methodEdits, setMethodEdits] = useState<Record<string, Partial<PaymentMethod>>>({});
+  const [pricingEdits, setPricingEdits] = useState<Record<string, Partial<PricingRow>>>({});
+  const dirty = Object.keys(methodEdits).length > 0 || Object.keys(pricingEdits).length > 0;
+
+  const saveMethod = useMutation((v: { id: string; body: Record<string, unknown> }) =>
+    payments.updateMethod(v.id, v.body),
+  );
+  const savePricing = useMutation((v: { code: string; body: Record<string, unknown> }) =>
+    payments.updatePricing(v.code, v.body),
+  );
+
+  const methodRows = useMemo(
+    () => methodList.map((m) => ({ ...m, ...methodEdits[m.id] })),
+    [methodList, methodEdits],
+  );
+  const pricingRows = useMemo(
+    () => (pricingQuery.data ?? []).map((p) => ({ ...p, ...pricingEdits[p.service_code] })),
+    [pricingQuery.data, pricingEdits],
+  );
+
+  function editMethod(id: string, patch: Partial<PaymentMethod>) {
+    setMethodEdits((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+  }
+  function editPricing(code: string, field: PriceField, value: number) {
+    setPricingEdits((prev) => {
+      const next: Partial<PricingRow> = { ...prev[code] };
+      next[field] = value;
+      return { ...prev, [code]: next };
     });
-  }, [inScope, query, services, methods, statuses]);
-
-  useEffect(() => setPage(1), [query, services, methods, statuses, dateRange, provinces, pageSize]);
-
-  const totalRows = rows.length;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const currentPage = Math.min(page, totalPages);
-  const start = (currentPage - 1) * pageSize;
-  const pageRows = rows.slice(start, start + pageSize);
-
-  /* ── Revenue aggregates ── */
-  const paid = inScope.filter((t) => t.status === "paid");
-  const collected = paid.reduce((s, t) => s + t.amount, 0);
-  const outstanding = inScope.filter((t) => t.status === "pending").reduce((s, t) => s + t.amount, 0);
-  const refunded = inScope.filter((t) => t.status === "refunded").reduce((s, t) => s + t.amount, 0);
-  const billed = collected + outstanding;
-  const collectionRate = billed > 0 ? (collected / billed) * 100 : 0;
-  const avgTicket = paid.length ? collected / paid.length : 0;
-
-  /* Revenue over time — buckets come from the shared calendar helper, so the bar
-   * count depends only on the date filter, never on which days happen to have a
-   * receipt. Days without receipts plot as zero. */
-  const trend = useMemo(() => {
-    const byDay: Record<string, number> = {};
-    for (const t of paid) byDay[t.date] = (byDay[t.date] ?? 0) + t.amount;
-    const allDates = TRANSACTIONS.map((t) => t.date).sort();
-    const { buckets, granularity } = calendarBuckets(dateRange, {
-      from: allDates[0] ?? "",
-      to: allDates[allDates.length - 1] ?? "",
-    });
-    return {
-      points: buckets.map((b) => ({
-        label: b.label,
-        revenue: b.days.reduce((s, d) => s + (byDay[d] ?? 0), 0),
-      })),
-      granularity,
-    };
-  }, [paid, dateRange]);
-
-  const byService = useMemo(() => {
-    const acc: Record<string, { collected: number; outstanding: number; count: number }> = {};
-    for (const s of SERVICES) acc[s.id] = { collected: 0, outstanding: 0, count: 0 };
-    for (const t of inScope) {
-      const a = acc[t.serviceId];
-      if (!a) continue;
-      if (t.status === "paid") { a.collected += t.amount; a.count += 1; }
-      if (t.status === "pending") a.outstanding += t.amount;
-    }
-    return SERVICES.map((s) => ({ service: s, ...acc[s.id] })).sort((a, b) => b.collected - a.collected);
-  }, [inScope]);
-  const maxService = Math.max(1, ...byService.map((r) => r.collected));
-
-  const byProvince = useMemo(() => {
-    const acc: Record<string, { collected: number; count: number }> = {};
-    for (const t of paid) {
-      acc[t.province] = acc[t.province] ?? { collected: 0, count: 0 };
-      acc[t.province].collected += t.amount;
-      acc[t.province].count += 1;
-    }
-    return Object.entries(acc)
-      .map(([province, v]) => ({ province, ...v }))
-      .sort((a, b) => b.collected - a.collected);
-  }, [paid]);
-  const maxProvince = Math.max(1, ...byProvince.map((r) => r.collected));
-
-  const byMethod = useMemo(() => {
-    const acc: Record<string, number> = {};
-    for (const t of paid) acc[t.method] = (acc[t.method] ?? 0) + t.amount;
-    return DEFAULT_METHODS.map((m) => ({
-      id: m.id, name: m.label, value: acc[m.id] ?? 0, color: METHOD_COLOR[m.id],
-    })).filter((r) => r.value > 0);
-  }, [paid]);
-
-  function updateMethod(id: string, patch: Partial<PaymentMethod>) {
-    setMethodConfig((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
-    setDirty(true);
   }
 
-  function updatePricing(serviceId: string, patch: Partial<ServicePricing>) {
-    setPricing((prev) => prev.map((p) => (p.serviceId === serviceId ? { ...p, ...patch } : p)));
-    setDirty(true);
-  }
-
-  function saveSettings() {
-    const enabled = methodConfig.filter((m) => m.enabled).length;
-    if (enabled === 0) {
+  async function saveSettings() {
+    const enabled = methodRows.filter((m) => m.enabled).length;
+    if (methodRows.length > 0 && enabled === 0) {
       toast.error("At least one payment method must stay enabled");
       return;
     }
-    setDirty(false);
-    toast.success("Payment settings saved", {
-      description: `${enabled} method${enabled !== 1 ? "s" : ""} enabled · fees applied to new applications only.`,
-    });
+    try {
+      for (const [id, patch] of Object.entries(methodEdits)) {
+        const body: Record<string, unknown> = {};
+        if (patch.enabled !== undefined) body.enabled = patch.enabled;
+        if (patch.fee_percent !== undefined) body.fee_percent = patch.fee_percent;
+        if (patch.settlement !== undefined) body.settlement = patch.settlement;
+        await saveMethod.run({ id, body });
+      }
+      for (const [code, patch] of Object.entries(pricingEdits)) {
+        const current = (pricingQuery.data ?? []).find((p) => p.service_code === code);
+        await savePricing.run({
+          code,
+          body: {
+            fee_lak: patch.fee_lak ?? current?.fee_lak ?? 0,
+            copy_fee_lak: patch.copy_fee_lak ?? current?.copy_fee_lak ?? 0,
+            late_fine_lak: patch.late_fine_lak ?? current?.late_fine_lak ?? 0,
+          },
+        });
+      }
+      setMethodEdits({});
+      setPricingEdits({});
+      methodsQuery.refetch();
+      pricingQuery.refetch();
+      toast.success("Payment settings saved", {
+        description: `${enabled} method${enabled !== 1 ? "s" : ""} enabled · fees applied to new applications only.`,
+      });
+    } catch (err) {
+      toast.error("Could not save the payment settings", { description: (err as ApiError).message });
+    }
   }
 
   function resetSettings() {
-    setMethodConfig(DEFAULT_METHODS);
-    setPricing(DEFAULT_PRICING);
-    setDirty(false);
+    setMethodEdits({});
+    setPricingEdits({});
+    methodsQuery.refetch();
+    pricingQuery.refetch();
     toast.info("Settings reverted to the published configuration");
   }
+
+  /* ── Row actions ── */
+  const confirmTx = useMutation((v: { id: string; external_ref?: string }) =>
+    payments.confirm(v.id, v.external_ref ? { external_ref: v.external_ref } : {}),
+  );
+  const refundTx = useMutation((v: { id: string; reason: string }) => payments.refund(v.id, { reason: v.reason }));
+  const [refundTarget, setRefundTarget] = useState<TxRow | null>(null);
+  const [refundReason, setRefundReason] = useState("");
+
+  async function onConfirm(row: TxRow) {
+    try {
+      await confirmTx.run({ id: row.id });
+      toast.success(`Receipt ${row.receipt_no} confirmed`);
+      txQuery.refetch();
+      txSummaryQuery.refetch();
+      summaryQuery.refetch();
+    } catch (err) {
+      toast.error("Could not confirm the receipt", { description: (err as ApiError).message });
+    }
+  }
+
+  async function onRefund() {
+    if (!refundTarget || !refundReason.trim()) return;
+    try {
+      await refundTx.run({ id: refundTarget.id, reason: refundReason.trim() });
+      toast.success(`Receipt ${refundTarget.receipt_no} refunded`);
+      setRefundTarget(null);
+      setRefundReason("");
+      txQuery.refetch();
+      txSummaryQuery.refetch();
+      summaryQuery.refetch();
+    } catch (err) {
+      toast.error("Could not refund the receipt", { description: (err as ApiError).message });
+    }
+  }
+
+  /* ── Export ── */
+  const [exporting, setExporting] = useState(false);
+  async function exportCsv() {
+    setExporting(true);
+    try {
+      const csv = await payments.exportCSV(listFilters);
+      downloadCsv(csv, `transactions-${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      toast.error("Export failed", { description: (err as ApiError).message });
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  /* ── Derived overview figures ── */
+  const summary = summaryQuery.data;
+  const collected = summary?.gross_lak ?? 0;
+  const outstanding = summary?.outstanding_lak ?? 0;
+  const refunded = summary?.refunded_lak ?? 0;
+  const paidCount = summary?.paid_count ?? 0;
+  const billed = collected + outstanding;
+  const collectionRate = billed > 0 ? (collected / billed) * 100 : 0;
+  const avgTicket = paidCount ? collected / paidCount : 0;
+
+  const trendPoints = useMemo(
+    () => (summary?.by_day ?? []).map((b) => ({ label: b.label || b.key, revenue: b.amount_lak })),
+    [summary],
+  );
+
+  const byMethod = useMemo(
+    () =>
+      (summary?.by_method ?? [])
+        .filter((b) => b.amount_lak > 0)
+        .map((b) => ({ id: b.key, name: b.label || b.key, value: b.amount_lak, color: b.color || FALLBACK_COLOR })),
+    [summary],
+  );
+
+  const outstandingByService = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const b of pendingQuery.data?.by_service ?? []) map[b.key] = b.amount_lak;
+    return map;
+  }, [pendingQuery.data]);
+
+  const byService = useMemo(
+    () =>
+      (summary?.by_service ?? [])
+        .map((b) => {
+          const svc = serviceByCode[b.key];
+          return {
+            code: b.key,
+            label: svc ? text(svc.name) : b.label || b.key,
+            color: svc?.color ?? FALLBACK_COLOR,
+            fee: svc?.fee_lak ?? 0,
+            collected: b.amount_lak,
+            count: b.count,
+            outstanding: outstandingByService[b.key] ?? 0,
+          };
+        })
+        .sort((a, b) => b.collected - a.collected),
+    [summary, serviceByCode, outstandingByService],
+  );
+  const maxService = Math.max(1, ...byService.map((r) => r.collected));
+
+  const byProvince = useMemo(
+    () =>
+      (provinceQuery.data?.by_province ?? [])
+        .map((b) => ({ id: b.key, province: b.label || b.key, collected: b.amount_lak, count: b.count }))
+        .sort((a, b) => b.collected - a.collected),
+    [provinceQuery.data],
+  );
+  const maxProvince = Math.max(1, ...byProvince.map((r) => r.collected));
+
+  const collectedByServiceCode = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const b of summary?.by_service ?? []) map[b.key] = b.amount_lak;
+    return map;
+  }, [summary]);
+
+  /* ── Transactions page state ── */
+  const rows = (txQuery.data?.data ?? []) as TxRow[];
+  const meta = txQuery.data?.meta;
+  const totalRows = meta?.total ?? 0;
+  const totalPages = Math.max(1, meta?.total_pages ?? 1);
+  const currentPage = meta?.page ?? page;
+  const start = (currentPage - 1) * pageSize;
+
+  const recon = reconQuery.data;
+  const reconRows = recon?.methods ?? [];
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -249,19 +526,23 @@ export function PaymentsPage() {
             <>
               <MultiSelectFilter
                 label="Province"
-                options={PROVINCE_OPTIONS}
+                options={provinceOptions}
                 selected={provinces}
                 onChange={setProvinces}
+                single
+                loading={provincesQuery.loading}
+                emptyLabel="No provinces in your jurisdiction"
               />
               <DateRangeFilter onChange={setDateRange} />
             </>
           )}
           {tab === "transactions" && (
             <button
-              onClick={() => exportCsv(rows)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+              onClick={exportCsv}
+              disabled={exporting}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-60"
             >
-              <Download className="w-4 h-4" /> Export
+              <Download className="w-4 h-4" /> {exporting ? "Exporting…" : "Export"}
             </button>
           )}
         </div>
@@ -295,11 +576,41 @@ export function PaymentsPage() {
       {/* ── Overview ── */}
       {tab === "overview" && (
         <>
+          {summaryQuery.error && (
+            <div className="bg-white rounded-2xl border border-gray-100 shadow-sm">
+              <ErrorState error={summaryQuery.error} onRetry={summaryQuery.refetch} />
+            </div>
+          )}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-            <Kpi icon={Banknote} label="Collected" value={lak(collected)} sub={`${paid.length} paid receipts`} tone="#047857" />
-            <Kpi icon={CircleAlert} label="Outstanding" value={lak(outstanding)} sub="Awaiting payment" tone="#B45309" />
-            <Kpi icon={TrendingUp} label="Collection rate" value={`${collectionRate.toFixed(1)}%`} sub={`of ${lak(billed)} billed`} tone="#3752AE" />
-            <Kpi icon={Receipt} label="Average receipt" value={lak(avgTicket)} sub={`${lak(refunded)} refunded`} tone="#6D28D9" />
+            <Kpi
+              icon={Banknote}
+              label="Collected"
+              value={summaryQuery.loading ? "…" : lak(collected)}
+              sub={`${paidCount.toLocaleString()} paid receipts`}
+              tone="#047857"
+            />
+            <Kpi
+              icon={CircleAlert}
+              label="Outstanding"
+              value={summaryQuery.loading ? "…" : lak(outstanding)}
+              sub="Awaiting payment"
+              tone="#B45309"
+            />
+            <Kpi
+              icon={TrendingUp}
+              label="Collection rate"
+              value={summaryQuery.loading ? "…" : `${collectionRate.toFixed(1)}%`}
+              sub={`of ${lak(billed)} billed`}
+              tone="#3752AE"
+            />
+            <Kpi
+              icon={Receipt}
+              label="Average receipt"
+              value={summaryQuery.loading ? "…" : lak(avgTicket)}
+              sub={`${lak(refunded)} refunded`}
+              tone="#6D28D9"
+            />
           </div>
 
           <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
@@ -308,25 +619,31 @@ export function PaymentsPage() {
               <div className="flex-shrink-0">
                 <h2 className="text-base font-semibold text-gray-800">Revenue collected</h2>
                 <p className="text-sm text-gray-400 mb-3">
-                  {trend.granularity === "day" ? "Per day" : trend.granularity === "week" ? "Per week" : "Per month"} · {lak(collected)} total
+                  Per day · {lak(collected)} total
                 </p>
               </div>
               {/* Fills the leftover card height so the bars line up with the
                   payment-method card beside it. */}
               <div className="flex-1 min-h-[256px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={trend.points} margin={{ top: 4, right: 8, bottom: 0, left: 4 }}>
-                    <CartesianGrid vertical={false} stroke="#F1F5F9" />
-                    <XAxis dataKey="label" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tickFormatter={formatLakShort} tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={44} />
-                    <Tooltip
-                      cursor={{ fill: "#F8FAFC" }}
-                      formatter={(v: number) => [lak(v), "Collected"]}
-                      contentStyle={{ borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 }}
-                    />
-                    <Bar dataKey="revenue" fill="#3752AE" radius={[4, 4, 0, 0]} maxBarSize={26} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {summaryQuery.loading ? (
+                  <CardMessage>Loading revenue…</CardMessage>
+                ) : trendPoints.length === 0 ? (
+                  <CardMessage>No revenue in this selection.</CardMessage>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={trendPoints} margin={{ top: 4, right: 8, bottom: 0, left: 4 }}>
+                      <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                      <XAxis dataKey="label" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tickFormatter={formatLakShort} tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={44} />
+                      <Tooltip
+                        cursor={{ fill: "#F8FAFC" }}
+                        formatter={(v: number) => [lak(v), "Collected"]}
+                        contentStyle={{ borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 }}
+                      />
+                      <Bar dataKey="revenue" fill="#3752AE" radius={[4, 4, 0, 0]} maxBarSize={26} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </div>
 
@@ -335,19 +652,23 @@ export function PaymentsPage() {
               <h2 className="text-base font-semibold text-gray-800">By payment method</h2>
               <p className="text-sm text-gray-400 mb-2">Share of collected revenue</p>
               <div className="h-44">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={byMethod} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={48} outerRadius={70} paddingAngle={3} cornerRadius={8} stroke="none">
-                      {byMethod.map((m) => (
-                        <Cell key={m.id} fill={m.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      formatter={(v: number, n) => [lak(v), n as string]}
-                      contentStyle={{ borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 }}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
+                {byMethod.length === 0 ? (
+                  <CardMessage>{summaryQuery.loading ? "Loading…" : "No revenue in this selection."}</CardMessage>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={byMethod} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={48} outerRadius={70} paddingAngle={3} cornerRadius={8} stroke="none">
+                        {byMethod.map((m) => (
+                          <Cell key={m.id} fill={m.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        formatter={(v: number, n) => [lak(v), n as string]}
+                        contentStyle={{ borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                )}
               </div>
               <div className="space-y-1.5 mt-2">
                 {byMethod.map((m) => (
@@ -384,15 +705,15 @@ export function PaymentsPage() {
                 </thead>
                 <tbody>
                   {byService.map((r) => (
-                    <tr key={r.service.id} className="border-b border-gray-50 last:border-0">
+                    <tr key={r.code} className="border-b border-gray-50 last:border-0">
                       <td className="px-5 py-3">
                         <span className="inline-flex items-center gap-2 text-gray-800">
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.service.color }} />
-                          {r.service.label}
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color }} />
+                          {r.label}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
-                        {r.service.fee === 0 ? "Free" : lak(r.service.fee)}
+                        {r.fee === 0 ? "Free" : lak(r.fee)}
                       </td>
                       <td className="px-4 py-3 text-gray-600">{r.count}</td>
                       <td className="px-4 py-3 font-medium text-gray-800 whitespace-nowrap">{lak(r.collected)}</td>
@@ -403,12 +724,19 @@ export function PaymentsPage() {
                         <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
                           <div
                             className="h-full rounded-full"
-                            style={{ width: `${(r.collected / maxService) * 100}%`, backgroundColor: r.service.color }}
+                            style={{ width: `${(r.collected / maxService) * 100}%`, backgroundColor: r.color }}
                           />
                         </div>
                       </td>
                     </tr>
                   ))}
+                  {byService.length === 0 && (
+                    <tr>
+                      <td colSpan={6}>
+                        <CardMessage>{summaryQuery.loading ? "Loading…" : "No revenue in this selection."}</CardMessage>
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
@@ -423,25 +751,31 @@ export function PaymentsPage() {
                 : `${byProvince.length} provinces collecting fees`}
             </p>
             <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
-              {byProvince.map((r) => (
-                <div key={r.province}>
-                  <div className="flex items-center justify-between gap-2 text-sm mb-1">
-                    <span className="text-gray-600 truncate">{r.province}</span>
-                    <span className="font-medium text-gray-800 whitespace-nowrap tabular-nums">
-                      {formatLakShort(r.collected)}
-                    </span>
+              {provinceQuery.error ? (
+                <ErrorState error={provinceQuery.error} onRetry={provinceQuery.refetch} />
+              ) : (
+                byProvince.map((r) => (
+                  <div key={r.id}>
+                    <div className="flex items-center justify-between gap-2 text-sm mb-1">
+                      <span className="text-gray-600 truncate">{r.province}</span>
+                      <span className="font-medium text-gray-800 whitespace-nowrap tabular-nums">
+                        {formatLakShort(r.collected)}
+                      </span>
+                    </div>
+                    <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-[#3752AE]"
+                        style={{ width: `${(r.collected / maxProvince) * 100}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-gray-400 mt-0.5">{r.count} receipts</p>
                   </div>
-                  <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-[#3752AE]"
-                      style={{ width: `${(r.collected / maxProvince) * 100}%` }}
-                    />
-                  </div>
-                  <p className="text-[11px] text-gray-400 mt-0.5">{r.count} receipts</p>
-                </div>
-              ))}
-              {byProvince.length === 0 && (
-                <p className="text-sm text-gray-400 text-center py-8">No revenue in this selection.</p>
+                ))
+              )}
+              {!provinceQuery.error && byProvince.length === 0 && (
+                <p className="text-sm text-gray-400 text-center py-8">
+                  {provinceQuery.loading ? "Loading…" : "No revenue in this selection."}
+                </p>
               )}
             </div>
           </div>
@@ -464,8 +798,21 @@ export function PaymentsPage() {
                 />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <MultiSelectFilter label="Services" options={SERVICE_OPTIONS} selected={services} onChange={setServices} />
-                <MultiSelectFilter label="Method" options={METHOD_OPTIONS} selected={methods} onChange={setMethods} />
+                <MultiSelectFilter
+                  label="Services"
+                  options={serviceOptions}
+                  selected={services}
+                  onChange={setServices}
+                  loading={servicesQuery.loading}
+                />
+                <MultiSelectFilter
+                  label="Method"
+                  options={methodOptions}
+                  selected={methodCodes}
+                  onChange={setMethodCodes}
+                  loading={methodsQuery.loading}
+                />
+                <MultiSelectFilter label="Type" options={KIND_OPTIONS} selected={kinds} onChange={setKinds} />
                 <MultiSelectFilter label="Status" options={TX_STATUS_OPTIONS} selected={statuses} onChange={setStatuses} />
               </div>
             </div>
@@ -476,7 +823,7 @@ export function PaymentsPage() {
               <h2 className="text-base font-semibold text-gray-800">
                 {totalRows} transaction{totalRows !== 1 ? "s" : ""}
                 <span className="text-gray-400 font-normal">
-                  {" "}· {lak(rows.filter((t) => t.status === "paid").reduce((s, t) => s + t.amount, 0))} collected
+                  {" "}· {lak(txSummaryQuery.data?.gross_lak ?? 0)} collected
                 </span>
               </h2>
               <div className="flex items-center gap-2 text-sm text-gray-500">
@@ -493,65 +840,100 @@ export function PaymentsPage() {
               </div>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
-                    <th className="px-5 py-3 font-medium">Receipt</th>
-                    <th className="px-4 py-3 font-medium">Date</th>
-                    <th className="px-4 py-3 font-medium">Payer</th>
-                    <th className="px-4 py-3 font-medium">Service</th>
-                    <th className="px-4 py-3 font-medium">Type</th>
-                    <th className="px-4 py-3 font-medium">Method</th>
-                    <th className="px-4 py-3 font-medium text-right">Amount</th>
-                    <th className="px-4 py-3 font-medium">Status</th>
-                    <th className="pl-4 pr-5 py-3 font-medium">Cashier</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pageRows.map((t) => (
-                    <tr key={t.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
-                      <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{t.id}</td>
-                      <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
-                        {t.date}
-                        <span className="block text-[11px] text-gray-400">{t.time}</span>
-                      </td>
-                      <td className="px-4 py-3 text-gray-800">
-                        {t.payer}
-                        <span className="block font-mono text-[11px] text-gray-400">{t.applicationId}</span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: SERVICE_BY_ID[t.serviceId]?.color }} />
-                          {serviceLabel(t.serviceId)}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{KIND_LABEL[t.kind]}</td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: METHOD_COLOR[t.method] }} />
-                          {DEFAULT_METHODS.find((m) => m.id === t.method)?.label}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-right font-medium text-gray-800 whitespace-nowrap">
-                        {t.amount.toLocaleString()}
-                      </td>
-                      <td className="px-4 py-3">
-                        <StatusChip status={t.status} />
-                      </td>
-                      <td className="pl-4 pr-5 py-3 text-gray-500 whitespace-nowrap">{t.cashier}</td>
+            {txQuery.error ? (
+              <ErrorState error={txQuery.error} onRetry={txQuery.refetch} />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                      <th className="px-5 py-3 font-medium">Receipt</th>
+                      <th className="px-4 py-3 font-medium">Date</th>
+                      <th className="px-4 py-3 font-medium">Payer</th>
+                      <th className="px-4 py-3 font-medium">Service</th>
+                      <th className="px-4 py-3 font-medium">Type</th>
+                      <th className="px-4 py-3 font-medium">Method</th>
+                      <th className="px-4 py-3 font-medium text-right">Amount</th>
+                      <th className="px-4 py-3 font-medium">Status</th>
+                      <th className="px-4 py-3 font-medium">Cashier</th>
+                      <th className="pl-4 pr-5 py-3 font-medium text-right">Action</th>
                     </tr>
-                  ))}
-                  {totalRows === 0 && (
-                    <tr>
-                      <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">
-                        No transactions match your filters.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody>
+                    {rows.map((t) => {
+                      const svc = serviceByCode[t.service_code];
+                      return (
+                        <tr key={t.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                          <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{t.receipt_no}</td>
+                          <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
+                            {t.date ?? t.paid_at?.slice(0, 10) ?? "—"}
+                            <span className="block text-[11px] text-gray-400">{t.time ?? ""}</span>
+                          </td>
+                          <td className="px-4 py-3 text-gray-800">
+                            {t.payer_name}
+                            <span className="block font-mono text-[11px] text-gray-400">{t.reference_no ?? "—"}</span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
+                              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color ?? FALLBACK_COLOR }} />
+                              {svc ? svc.short_name || text(svc.name) : t.service_code}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{KIND_LABEL[t.kind] ?? t.kind}</td>
+                          <td className="px-4 py-3">
+                            <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
+                              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: t.method_color ?? FALLBACK_COLOR }} />
+                              {text(t.method_label) || t.method_code}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-right font-medium text-gray-800 whitespace-nowrap">
+                            {t.amount_lak.toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3">
+                            <StatusChip status={t.status} />
+                          </td>
+                          <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{t.cashier_name ?? "—"}</td>
+                          <td className="pl-4 pr-5 py-3 text-right whitespace-nowrap">
+                            {canManage && t.status === "pending" && (
+                              <button
+                                onClick={() => onConfirm(t)}
+                                disabled={confirmTx.pending}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" /> Confirm
+                              </button>
+                            )}
+                            {canManage && t.status === "paid" && (
+                              <button
+                                onClick={() => {
+                                  setRefundTarget(t);
+                                  setRefundReason("");
+                                }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                              >
+                                <Undo2 className="w-3.5 h-3.5" /> Refund
+                              </button>
+                            )}
+                            {(!canManage || (t.status !== "pending" && t.status !== "paid")) && (
+                              <span className="text-gray-300">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {rows.length === 0 && (
+                      <tr>
+                        <td colSpan={10}>
+                          <CardMessage>
+                            {txQuery.loading ? "Loading transactions…" : "No transactions match your filters."}
+                          </CardMessage>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
             {totalRows > 0 && (
               <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-gray-100">
@@ -583,6 +965,88 @@ export function PaymentsPage() {
         </>
       )}
 
+      {/* ── Reconciliation ── */}
+      {tab === "reconciliation" && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100">
+            <h2 className="text-base font-semibold text-gray-800">Settlement by payment method</h2>
+            <p className="text-sm text-gray-400">
+              What each provider collected, the commission it withholds, and what is still to be settled.
+            </p>
+          </div>
+          {reconQuery.error ? (
+            <ErrorState error={reconQuery.error} onRetry={reconQuery.refetch} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                    <th className="px-5 py-3 font-medium">Method</th>
+                    <th className="px-4 py-3 font-medium">Settlement account</th>
+                    <th className="px-4 py-3 font-medium text-right">Receipts</th>
+                    <th className="px-4 py-3 font-medium text-right">Collected</th>
+                    <th className="px-4 py-3 font-medium text-right">Provider fee</th>
+                    <th className="px-4 py-3 font-medium text-right">Net</th>
+                    <th className="pl-4 pr-5 py-3 font-medium text-right">Unreconciled</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reconRows.map((r) => (
+                    <tr key={r.method_code} className="border-b border-gray-50 last:border-0">
+                      <td className="px-5 py-3">
+                        <span className="inline-flex items-center gap-2 text-gray-800 whitespace-nowrap">
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.color ?? FALLBACK_COLOR }} />
+                          {text(r.method_label) || r.method_code}
+                        </span>
+                        <span className="block text-[11px] text-gray-400 pl-4">
+                          {(r.fee_percent ?? 0).toFixed(1)}% commission
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-gray-500">{r.settlement_account || "—"}</td>
+                      <td className="px-4 py-3 text-right text-gray-600 tabular-nums">{r.count.toLocaleString()}</td>
+                      <td className="px-4 py-3 text-right font-medium text-gray-800 whitespace-nowrap">{lak(r.collected_lak)}</td>
+                      <td className="px-4 py-3 text-right text-gray-500 whitespace-nowrap">
+                        {r.provider_fee_lak > 0 ? lak(r.provider_fee_lak) : "—"}
+                      </td>
+                      <td className="px-4 py-3 text-right text-gray-800 whitespace-nowrap">{lak(r.net_lak)}</td>
+                      <td className="pl-4 pr-5 py-3 text-right whitespace-nowrap">
+                        {(r.unreconciled_count ?? 0) > 0 ? (
+                          <span className="text-amber-700">
+                            {lak(r.unreconciled_lak ?? 0)}
+                            <span className="block text-[11px] text-gray-400">
+                              {(r.unreconciled_count ?? 0).toLocaleString()} receipts
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">Settled</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {reconRows.length === 0 && (
+                    <tr>
+                      <td colSpan={7}>
+                        <CardMessage>
+                          {reconQuery.loading ? "Loading reconciliation…" : "Nothing to reconcile in this selection."}
+                        </CardMessage>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {recon?.totals && reconRows.length > 0 && (
+            <div className="px-5 py-3 border-t border-gray-100 flex flex-wrap items-center gap-x-6 gap-y-1 text-sm text-gray-500">
+              <span>Collected <span className="font-medium text-gray-800">{lak(recon.totals.collected_lak ?? 0)}</span></span>
+              <span>Provider fees <span className="font-medium text-gray-800">{lak(recon.totals.provider_fee_lak ?? 0)}</span></span>
+              <span>Net <span className="font-medium text-gray-800">{lak(recon.totals.net_lak ?? 0)}</span></span>
+              <span>Unreconciled <span className="font-medium text-gray-800">{lak(recon.totals.unreconciled_lak ?? 0)}</span></span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── Settings ── */}
       {tab === "settings" && (
         <>
@@ -594,61 +1058,75 @@ export function PaymentsPage() {
                 Enable the channels citizens can pay with, and record the commission withheld on settlement.
               </p>
             </div>
-            <div className="divide-y divide-gray-50">
-              {methodConfig.map((m) => {
-                const Icon = METHOD_ICON[m.kind];
-                return (
-                  <div key={m.id} className="p-5 flex flex-col lg:flex-row lg:items-center gap-4">
-                    <div className="flex items-start gap-3 flex-1 min-w-0">
-                      <span
-                        className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-                        style={{ backgroundColor: `${METHOD_COLOR[m.id]}14`, color: METHOD_COLOR[m.id] }}
-                      >
-                        <Icon className="w-5 h-5" />
-                      </span>
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold text-gray-800">{m.label}</p>
-                        <p className="text-xs text-gray-400">{m.note}</p>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-4">
-                      <label className="text-xs text-gray-400 block">
-                        Commission
-                        <div className="flex items-center gap-1 mt-1">
-                          <input
-                            type="number"
-                            step="0.1"
-                            min="0"
-                            max="10"
-                            value={m.feePercent}
-                            onChange={(e) => updateMethod(m.id, { feePercent: Number(e.target.value) })}
-                            className="w-20 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
-                          />
-                          <span className="text-sm text-gray-500">%</span>
-                        </div>
-                      </label>
-
-                      <label className="text-xs text-gray-400 block">
-                        Settlement account
-                        <input
-                          value={m.settlement}
-                          onChange={(e) => updateMethod(m.id, { settlement: e.target.value })}
-                          className="block w-64 mt-1 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
-                        />
-                      </label>
-
-                      <div className="flex items-center gap-2.5 lg:pl-2">
-                        <Switch checked={m.enabled} onCheckedChange={(v) => updateMethod(m.id, { enabled: v })} />
-                        <span className={`text-sm font-medium ${m.enabled ? "text-gray-700" : "text-gray-400"}`}>
-                          {m.enabled ? "Enabled" : "Disabled"}
+            {methodsQuery.error ? (
+              <ErrorState error={methodsQuery.error} onRetry={methodsQuery.refetch} />
+            ) : (
+              <div className="divide-y divide-gray-50">
+                {methodRows.map((m) => {
+                  const Icon = METHOD_ICON[m.kind] ?? CreditCard;
+                  const color = m.color || FALLBACK_COLOR;
+                  return (
+                    <div key={m.id} className="p-5 flex flex-col lg:flex-row lg:items-center gap-4">
+                      <div className="flex items-start gap-3 flex-1 min-w-0">
+                        <span
+                          className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+                          style={{ backgroundColor: `${color}14`, color }}
+                        >
+                          <Icon className="w-5 h-5" />
                         </span>
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-gray-800">{text(m.label)}</p>
+                          <p className="text-xs text-gray-400">{m.note}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-4">
+                        <label className="text-xs text-gray-400 block">
+                          Commission
+                          <div className="flex items-center gap-1 mt-1">
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              max="10"
+                              disabled={!canManage}
+                              value={m.fee_percent}
+                              onChange={(e) => editMethod(m.id, { fee_percent: Number(e.target.value) })}
+                              className="w-20 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE] disabled:opacity-50"
+                            />
+                            <span className="text-sm text-gray-500">%</span>
+                          </div>
+                        </label>
+
+                        <label className="text-xs text-gray-400 block">
+                          Settlement account
+                          <input
+                            value={m.settlement}
+                            disabled={!canManage}
+                            onChange={(e) => editMethod(m.id, { settlement: e.target.value })}
+                            className="block w-64 mt-1 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE] disabled:opacity-50"
+                          />
+                        </label>
+
+                        <div className="flex items-center gap-2.5 lg:pl-2">
+                          <Switch
+                            checked={m.enabled}
+                            disabled={!canManage}
+                            onCheckedChange={(v) => editMethod(m.id, { enabled: v })}
+                          />
+                          <span className={`text-sm font-medium ${m.enabled ? "text-gray-700" : "text-gray-400"}`}>
+                            {m.enabled ? "Enabled" : "Disabled"}
+                          </span>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+                {methodRows.length === 0 && (
+                  <CardMessage>{methodsQuery.loading ? "Loading methods…" : "No payment methods configured."}</CardMessage>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Service pricing */}
@@ -659,59 +1137,74 @@ export function PaymentsPage() {
                 Tariffs in LAK. Set a fee to 0 to make a service free of charge.
               </p>
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
-                    <th className="px-5 py-3 font-medium">Service</th>
-                    <th className="px-4 py-3 font-medium">Service fee</th>
-                    <th className="px-4 py-3 font-medium">Certified copy</th>
-                    <th className="px-4 py-3 font-medium">Late fine</th>
-                    <th className="pl-4 pr-5 py-3 font-medium">Collected to date</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pricing.map((p) => {
-                    const svc = SERVICE_BY_ID[p.serviceId];
-                    const collectedForService = TRANSACTIONS
-                      .filter((t) => t.serviceId === p.serviceId && t.status === "paid")
-                      .reduce((s, t) => s + t.amount, 0);
-                    return (
-                      <tr key={p.serviceId} className="border-b border-gray-50 last:border-0">
-                        <td className="px-5 py-3">
-                          <span className="inline-flex items-center gap-2 text-gray-800">
-                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
-                            {svc?.label}
-                          </span>
-                          <span className="block text-[11px] text-gray-400 pl-4">{svc?.laLabel}</span>
-                        </td>
-                        {(["fee", "copyFee", "lateFine"] as const).map((field) => (
-                          <td key={field} className="px-4 py-3">
-                            <input
-                              type="number"
-                              min="0"
-                              step="1000"
-                              value={p[field]}
-                              onChange={(e) => updatePricing(p.serviceId, { [field]: Number(e.target.value) })}
-                              className="w-32 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE]"
-                            />
+            {pricingQuery.error ? (
+              <ErrorState error={pricingQuery.error} onRetry={pricingQuery.refetch} />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                      <th className="px-5 py-3 font-medium">Service</th>
+                      <th className="px-4 py-3 font-medium">Service fee</th>
+                      <th className="px-4 py-3 font-medium">Certified copy</th>
+                      <th className="px-4 py-3 font-medium">Late fine</th>
+                      <th className="pl-4 pr-5 py-3 font-medium">Collected to date</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pricingRows.map((p) => {
+                      const svc = serviceByCode[p.service_code];
+                      return (
+                        <tr key={p.service_code} className="border-b border-gray-50 last:border-0">
+                          <td className="px-5 py-3">
+                            <span className="inline-flex items-center gap-2 text-gray-800">
+                              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color ?? FALLBACK_COLOR }} />
+                              {svc ? text(svc.name) : text(p.service_name) || p.service_code}
+                            </span>
+                            <span className="block text-[11px] text-gray-400 pl-4">
+                              {svc ? text(svc.name, "lo") : ""}
+                            </span>
                           </td>
-                        ))}
-                        <td className="pl-4 pr-5 py-3 text-gray-500 whitespace-nowrap">{lak(collectedForService)}</td>
+                          {(["fee_lak", "copy_fee_lak", "late_fine_lak"] as const).map((field) => (
+                            <td key={field} className="px-4 py-3">
+                              <input
+                                type="number"
+                                min="0"
+                                step="1000"
+                                disabled={!canManage}
+                                value={p[field] ?? 0}
+                                onChange={(e) => editPricing(p.service_code, field, Number(e.target.value))}
+                                className="w-32 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 outline-none focus:border-[#3752AE] disabled:opacity-50"
+                              />
+                            </td>
+                          ))}
+                          <td className="pl-4 pr-5 py-3 text-gray-500 whitespace-nowrap">
+                            {lak(collectedByServiceCode[p.service_code] ?? 0)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {pricingRows.length === 0 && (
+                      <tr>
+                        <td colSpan={5}>
+                          <CardMessage>{pricingQuery.loading ? "Loading tariffs…" : "No pricing configured."}</CardMessage>
+                        </td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           {/* Save bar */}
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <p className="text-sm text-gray-500">
-              {dirty
-                ? "You have unsaved changes. New tariffs apply to applications created after saving."
-                : "Configuration matches the published settings."}
+              {!canManage
+                ? "Your role can view the payment configuration but not change it."
+                : dirty
+                  ? "You have unsaved changes. New tariffs apply to applications created after saving."
+                  : "Configuration matches the published settings."}
             </p>
             <div className="flex items-center gap-2">
               <button
@@ -723,7 +1216,7 @@ export function PaymentsPage() {
               </button>
               <button
                 onClick={saveSettings}
-                disabled={!dirty}
+                disabled={!dirty || !canManage || saveMethod.pending || savePricing.pending}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Save className="w-4 h-4" /> Save changes
@@ -732,6 +1225,45 @@ export function PaymentsPage() {
           </div>
         </>
       )}
+
+      {/* Refund needs a recorded reason — the API rejects a blank one. */}
+      <Dialog open={!!refundTarget} onOpenChange={(open) => !open && setRefundTarget(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Refund receipt {refundTarget?.receipt_no}</DialogTitle>
+            <DialogDescription>
+              {refundTarget ? `${lak(refundTarget.amount_lak)} paid by ${refundTarget.payer_name}.` : ""} The reason is
+              written to the audit trail.
+            </DialogDescription>
+          </DialogHeader>
+          <label className="block">
+            <span className="text-sm font-medium text-gray-700">Reason</span>
+            <textarea
+              value={refundReason}
+              onChange={(e) => setRefundReason(e.target.value)}
+              rows={3}
+              placeholder="Why is this receipt being refunded?"
+              className="mt-1.5 w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 outline-none focus:border-[#3752AE] placeholder:text-gray-400"
+            />
+          </label>
+          {refundTx.error && <p className="text-sm text-red-600">{refundTx.error.message}</p>}
+          <DialogFooter>
+            <button
+              onClick={() => setRefundTarget(null)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onRefund}
+              disabled={!refundReason.trim() || refundTx.pending}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Undo2 className="w-4 h-4" /> {refundTx.pending ? "Refunding…" : "Refund"}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

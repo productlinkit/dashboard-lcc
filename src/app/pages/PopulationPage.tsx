@@ -7,18 +7,11 @@ import {
   Search, Users, Home, Briefcase, TrendingUp, TrendingDown, Baby, Globe, ArrowLeftRight,
   Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download,
 } from "lucide-react";
-import {
-  CITIZENS,
-  HOUSEHOLDS,
-  POPULATION_SUMMARY,
-  DEMOGRAPHIC_TREND,
-  WORKING_AGE,
-  areaStat,
-  type Citizen,
-  type Household,
-} from "../data/population";
+import { households as householdsApi, registry } from "../api/endpoints";
+import { useDebounced, useMutation, useQuery } from "../api/hooks";
+import { text, type HouseholdMember, type PersonRow } from "../api/types";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
-import { LocationFilter, NO_LOCATION, type LocationValue } from "../components/LocationFilter";
+import { LocationFilter, NO_LOCATION, locationName, type LocationValue } from "../components/LocationFilter";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "../components/ui/dialog";
@@ -28,11 +21,13 @@ const MALE_COLOR = "#3752AE";
 const FEMALE_COLOR = "#EC4899";
 const BIRTH_COLOR = "#10B981";
 const DEATH_COLOR = "#64748B";
-const IN_COLOR = "#3752AE";
 const OUT_COLOR = "#F59E0B";
 const LOCAL_COLOR = "#3752AE";
 const FOREIGN_COLOR = "#F59E0B";
 const tooltipStyle = { borderRadius: 12, border: "1px solid #E2E8F0", fontSize: 12 };
+
+/** Working age follows the standard 15–64 band, the same split the API reports. */
+const WORKING_AGE = { from: 15, to: 64 };
 
 const STATUS_META: Record<string, { label: string; color: string; bg: string }> = {
   active: { label: "Active", color: "#047857", bg: "#D1FAE5" },
@@ -45,6 +40,15 @@ const GENDER_OPTIONS = [
   { value: "female", label: "Female", color: FEMALE_COLOR },
 ];
 const CITIZEN_STATUS_OPTIONS = Object.entries(STATUS_META).map(([value, m]) => ({ value, label: m.label, color: m.color }));
+
+/** The register endpoints read a multi-select as one comma-separated parameter. */
+const listParam = (values: string[]) => (values.length ? values.join(",") : undefined);
+
+interface OpenPerson {
+  uin: string;
+  name: string;
+  address: string;
+}
 
 function Kpi({
   icon: Icon, label, value, sub, tone,
@@ -67,7 +71,7 @@ function Kpi({
 }
 
 function StatusChip({ status }: { status: string }) {
-  const m = STATUS_META[status];
+  const m = STATUS_META[status] ?? { label: status, color: "#475569", bg: "#F1F5F9" };
   return (
     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap" style={{ color: m.color, backgroundColor: m.bg }}>
       <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: m.color }} />
@@ -86,11 +90,31 @@ function GenderDot({ gender }: { gender: string }) {
   );
 }
 
-function exportCitizens(rows: Citizen[]) {
+function ageOf(member: HouseholdMember): number | undefined {
+  if (typeof member.age === "number") return member.age;
+  if (!member.date_of_birth) return undefined;
+  const born = new Date(member.date_of_birth);
+  if (Number.isNaN(born.getTime())) return undefined;
+  const now = new Date();
+  let age = now.getFullYear() - born.getFullYear();
+  const monthDiff = now.getMonth() - born.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < born.getDate())) age -= 1;
+  return age;
+}
+
+function downloadCitizens(rows: PersonRow[]) {
   const header = ["UIN", "Name", "Gender", "Date of birth", "Age", "Household", "Village", "District", "Province", "Status"];
   const body = rows.map((c) => [
-    c.uin, c.name, c.gender, c.dob, String(c.age), c.householdNo, c.village, c.district, c.province,
-    STATUS_META[c.status].label,
+    c.uin,
+    text(c.name),
+    c.gender,
+    c.date_of_birth ?? "",
+    String(c.age),
+    c.household_no,
+    c.jurisdiction?.village_name ?? "",
+    c.jurisdiction?.district_name ?? "",
+    c.jurisdiction?.province_name ?? "",
+    STATUS_META[c.status]?.label ?? c.status,
   ]);
   const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
   const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
@@ -102,6 +126,35 @@ function exportCitizens(rows: Citizen[]) {
   URL.revokeObjectURL(url);
 }
 
+/** Loading / failure / empty body for a table, in the row style of the page. */
+function TableState({
+  colSpan, loading, message, onRetry, empty,
+}: {
+  colSpan: number; loading: boolean; message?: string; onRetry?: () => void; empty: string;
+}) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="px-5 py-12 text-center">
+        {loading ? (
+          <span className="text-sm text-gray-400">Loading…</span>
+        ) : message ? (
+          <span className="inline-flex flex-col items-center gap-2">
+            <span className="text-sm text-gray-600">{message}</span>
+            <button
+              onClick={onRetry}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+            >
+              Retry
+            </button>
+          </span>
+        ) : (
+          <span className="text-sm text-gray-400">{empty}</span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 export function PopulationPage() {
   const [tab, setTab] = useState<"citizens" | "households">("citizens");
   const [query, setQuery] = useState("");
@@ -110,71 +163,156 @@ export function PopulationPage() {
   const [statuses, setStatuses] = useState<string[]>([]);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
-  const [openHousehold, setOpenHousehold] = useState<Household | null>(null);
-  const [openPerson, setOpenPerson] = useState<Citizen | null>(null);
+  const [openHouseholdNo, setOpenHouseholdNo] = useState<string | null>(null);
+  const [openPerson, setOpenPerson] = useState<OpenPerson | null>(null);
 
-  const inLocation = (o: { province: string; district: string; village: string }) =>
-    (!location.province || o.province === location.province) &&
-    (!location.district || o.district === location.district) &&
-    (!location.village || o.village === location.village);
+  const search = useDebounced(query.trim());
+  const areaName = locationName(location);
+  const scoped = !!location.provinceId;
 
-  const citizenRows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return CITIZENS.filter((c) => {
-      if (!inLocation(c)) return false;
-      if (genders.length && !genders.includes(c.gender)) return false;
-      if (statuses.length && !statuses.includes(c.status)) return false;
-      if (q && !`${c.uin} ${c.name} ${c.householdNo} ${c.village} ${c.province}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, location, genders, statuses]);
+  const provinceId = location.provinceId;
+  const districtId = location.districtId;
+  const villageId = location.villageId;
 
-  const householdRows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return HOUSEHOLDS.filter((h) => {
-      if (!inLocation(h)) return false;
-      if (q && !`${h.no} ${h.head} ${h.village} ${h.district} ${h.province}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, location]);
+  const scope = useMemo(
+    () => ({ province_id: provinceId, district_id: districtId, village_id: villageId }),
+    [provinceId, districtId, villageId],
+  );
 
-  useEffect(() => setPage(1), [tab, query, location, genders, statuses, pageSize]);
+  useEffect(() => setPage(1), [tab, search, provinceId, districtId, villageId, genders, statuses, pageSize]);
 
-  const totalRows = tab === "citizens" ? citizenRows.length : householdRows.length;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const currentPage = Math.min(page, totalPages);
+  /* ── Demographic aggregates, all scoped by the location filter ───────── */
+  const summaryQuery = useQuery((signal) => registry.populationSummary(scope, signal), [scope]);
+  const ageQuery = useQuery((signal) => registry.ageDistribution(scope, signal), [scope]);
+  const trendQuery = useQuery((signal) => registry.trend(scope, signal), [scope]);
+  const regionsQuery = useQuery((signal) => registry.regions(scope, signal), [scope], { enabled: !scoped });
+  const areaQuery = useQuery((signal) => registry.area(scope, signal), [scope], { enabled: scoped });
+
+  const summary = summaryQuery.data;
+  const ageBands = ageQuery.data ?? [];
+  const trend = trendQuery.data ?? [];
+
+  /* ── The register itself — filtered and paginated by the API ─────────── */
+  const citizensQuery = useQuery(
+    (signal) =>
+      registry.persons(
+        {
+          ...scope,
+          search: search || undefined,
+          gender: listParam(genders),
+          status: listParam(statuses),
+          page: tab === "citizens" ? page : 1,
+          per_page: tab === "citizens" ? pageSize : 1,
+          sort: search ? undefined : "name",
+        },
+        signal,
+      ),
+    [scope, search, genders.join(","), statuses.join(","), tab, page, pageSize],
+  );
+
+  const householdsQuery = useQuery(
+    (signal) =>
+      householdsApi.list(
+        {
+          ...scope,
+          search: search || undefined,
+          page: tab === "households" ? page : 1,
+          per_page: tab === "households" ? pageSize : 1,
+        },
+        signal,
+      ),
+    [scope, search, tab, page, pageSize],
+  );
+
+  // A person row carries the family book number, not its id, so look it up by number.
+  const householdQuery = useQuery(
+    (signal) => householdsApi.byNo(openHouseholdNo as string, signal),
+    [openHouseholdNo],
+    { enabled: !!openHouseholdNo },
+  );
+
+  /* Export walks the filtered result set on the server rather than the page. */
+  const exportRun = useMutation(async () => {
+    const collected: PersonRow[] = [];
+    for (let p = 1; p <= 10; p++) {
+      const result = await registry.persons({
+        ...scope,
+        search: search || undefined,
+        gender: listParam(genders),
+        status: listParam(statuses),
+        page: p,
+        per_page: 200,
+        sort: search ? undefined : "name",
+      });
+      collected.push(...result.data);
+      if (!result.meta.has_next) break;
+    }
+    downloadCitizens(collected);
+    return collected.length;
+  });
+
+  const citizenTotal = citizensQuery.data?.meta.total ?? 0;
+  const householdTotal = householdsQuery.data?.meta.total ?? 0;
+  const activeQuery = tab === "citizens" ? citizensQuery : householdsQuery;
+  const totalRows = tab === "citizens" ? citizenTotal : householdTotal;
+  const meta = activeQuery.data?.meta;
+  const totalPages = Math.max(1, meta?.total_pages ?? 1);
+  const currentPage = meta?.page ?? page;
   const start = (currentPage - 1) * pageSize;
-  const pageCitizens = citizenRows.slice(start, start + pageSize);
-  const pageHouseholds = householdRows.slice(start, start + pageSize);
-
-  // The demographic overview is scoped to the selected area (country when none).
-  const area = useMemo(() => areaStat(location.province, location.district, location.village), [location]);
-  const scoped = !!location.province;
+  const pageCitizens = citizensQuery.data?.data ?? [];
+  const pageHouseholds = householdsQuery.data?.data ?? [];
 
   const genderData = [
-    { name: "Male", value: area.male, color: MALE_COLOR },
-    { name: "Female", value: area.female, color: FEMALE_COLOR },
+    { name: "Male", value: summary?.male ?? 0, color: MALE_COLOR },
+    { name: "Female", value: summary?.female ?? 0, color: FEMALE_COLOR },
   ];
   const originData = [
-    { name: "Lao nationals", value: area.population - area.foreign, color: LOCAL_COLOR },
-    { name: "Foreign residents", value: area.foreign, color: FOREIGN_COLOR },
+    { name: "Lao nationals", value: summary?.local ?? 0, color: LOCAL_COLOR },
+    { name: "Foreign residents", value: summary?.foreign ?? 0, color: FOREIGN_COLOR },
   ];
-  const avgHousehold = area.households ? area.population / area.households : 0;
-  const workingPct = area.population ? Math.round((area.workingAge / area.population) * 100) : 0;
-  const maxChild = area.children[0]?.population ?? 1;
+  const population = summary?.citizens ?? 0;
+  const avgHousehold = summary?.avg_household_size ?? 0;
+  const workingPct = population ? Math.round(((summary?.working_age ?? 0) / population) * 100) : 0;
 
-  const s = POPULATION_SUMMARY;
-  const growthUp = s.growthPct >= 0;
-  const changeSeries = DEMOGRAPHIC_TREND.map((m) => ({
+  /* The breakdown table: provinces nationwide, children of the area when scoped. */
+  const breakdown = useMemo(() => {
+    if (scoped) {
+      return {
+        label: areaQuery.data?.child_label || "Districts",
+        rows: (areaQuery.data?.children ?? []).map((c) => ({
+          key: c.id ?? c.name,
+          name: c.name,
+          population: c.population,
+          households: c.households,
+        })),
+        query: areaQuery,
+      };
+    }
+    return {
+      label: "Provinces",
+      rows: (regionsQuery.data ?? []).map((r) => ({
+        key: r.province_id ?? r.province,
+        name: r.province,
+        population: r.population,
+        households: r.households,
+      })),
+      query: regionsQuery,
+    };
+  }, [scoped, areaQuery, regionsQuery]);
+  const maxChild = Math.max(1, ...breakdown.rows.map((r) => r.population));
+
+  const growthPct = summary?.growth_pct ?? 0;
+  const growthUp = growthPct >= 0;
+  const changeSeries = trend.map((m) => ({
     month: m.month,
     births: m.births,
     deaths: m.deaths,
-    movedIn: m.movedIn,
-    movedOut: m.movedOut,
+    movedIn: m.moved_in,
+    movedOut: m.moved_out,
     population: m.population,
   }));
+
+  const household = householdQuery.data;
 
   /* Opening a citizen replaces the page, the same way Watchlist Search does. */
   if (openPerson) {
@@ -189,10 +327,11 @@ export function PopulationPage() {
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
           <h1 className="text-xl font-bold text-gray-800">{openPerson.name}</h1>
           <p className="text-sm text-gray-400 mt-0.5">
-            {openPerson.uin} · {openPerson.village}, {openPerson.district}, {openPerson.province}
+            {openPerson.uin}
+            {openPerson.address ? ` · ${openPerson.address}` : ""}
           </p>
         </div>
-        <PersonRecord person={openPerson} />
+        <PersonRecord uin={openPerson.uin} />
       </div>
     );
   }
@@ -204,14 +343,15 @@ export function PopulationPage() {
         <div>
           <h1 className="text-xl font-bold text-gray-800">Population &amp; Households</h1>
           <p className="text-sm text-gray-400 mt-0.5">
-            Registered population of {area.name} — filter by province, district or village.
+            Registered population of {areaName} — filter by province, district or village.
           </p>
         </div>
         <button
-          onClick={() => exportCitizens(citizenRows)}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto"
+          onClick={() => exportRun.run(undefined).catch(() => {})}
+          disabled={exportRun.pending}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] disabled:opacity-60 self-start sm:self-auto"
         >
-          <Download className="w-4 h-4" /> Export
+          <Download className="w-4 h-4" /> {exportRun.pending ? "Exporting…" : "Export"}
         </button>
       </div>
 
@@ -220,31 +360,54 @@ export function PopulationPage() {
         <LocationFilter value={location} onChange={setLocation} />
       </div>
 
+      {summaryQuery.error && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm text-gray-600">{summaryQuery.error.message}</p>
+          <button
+            onClick={summaryQuery.refetch}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* KPIs (scoped to the selected area) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <Kpi icon={Users} label="Registered population" value={area.population.toLocaleString()} sub={`${area.male.toLocaleString()} male · ${area.female.toLocaleString()} female`} tone="#3752AE" />
-        <Kpi icon={Home} label="Households" value={area.households.toLocaleString()} sub={`Avg ${avgHousehold.toFixed(1)} people per household`} tone="#10B981" />
-        <Kpi icon={Briefcase} label="Working age (15–64)" value={area.workingAge.toLocaleString()} sub={`${workingPct}% · dependency ${area.workingAge ? Math.round(((area.population - area.workingAge) / area.workingAge) * 100) : 0}%`} tone="#6D28D9" />
-        <Kpi icon={Globe} label="Foreign residents" value={area.foreign.toLocaleString()} sub={area.population ? `${((area.foreign / area.population) * 100).toFixed(1)}% of population` : "—"} tone="#F59E0B" />
+        <Kpi icon={Users} label="Registered population" value={population.toLocaleString()} sub={`${(summary?.male ?? 0).toLocaleString()} male · ${(summary?.female ?? 0).toLocaleString()} female`} tone="#3752AE" />
+        <Kpi icon={Home} label="Households" value={(summary?.households ?? 0).toLocaleString()} sub={`Avg ${avgHousehold.toFixed(1)} people per household`} tone="#10B981" />
+        <Kpi icon={Briefcase} label="Working age (15–64)" value={(summary?.working_age ?? 0).toLocaleString()} sub={`${workingPct}% · dependency ${summary?.dependency_ratio ?? 0}%`} tone="#6D28D9" />
+        <Kpi icon={Globe} label="Foreign residents" value={(summary?.foreign ?? 0).toLocaleString()} sub={population ? `${(((summary?.foreign ?? 0) / population) * 100).toFixed(1)}% of population` : "—"} tone="#F59E0B" />
       </div>
 
       {/* Age & gender + composition (scoped) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {area.name}</h2>
+          <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {areaName}</h2>
           <p className="text-sm text-gray-400 mb-3">Registered population by age band · working age {WORKING_AGE.from}–{WORKING_AGE.to}</p>
           <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={area.ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
-                <CartesianGrid horizontal={false} stroke="#F1F5F9" />
-                <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
-                <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
-                <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
-                <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
-                <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
-              </BarChart>
-            </ResponsiveContainer>
+            {ageQuery.error ? (
+              <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
+                <p className="text-sm text-gray-600">{ageQuery.error.message}</p>
+                <button onClick={ageQuery.refetch} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]">Retry</button>
+              </div>
+            ) : ageBands.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-sm text-gray-400">
+                {ageQuery.loading ? "Loading…" : "No population registered in this area."}
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
+                  <CartesianGrid horizontal={false} stroke="#F1F5F9" />
+                  <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                  <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
+                  <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
+                  <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
+                  <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -293,66 +456,84 @@ export function PopulationPage() {
         </div>
       </div>
 
-      {scoped ? (
-        /* Area breakdown — the children of the selected level */
-        area.children.length > 0 && (
-          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-            <div className="px-5 py-4 border-b border-gray-100">
-              <h2 className="text-base font-semibold text-gray-800">{area.childLabel} of {area.name}</h2>
-              <p className="text-sm text-gray-400">Population and households within this area</p>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
-                    <th className="px-5 py-3 font-medium">{area.childLabel.replace(/s$/, "")}</th>
-                    <th className="px-4 py-3 font-medium w-1/2">Population</th>
-                    <th className="pl-4 pr-5 py-3 font-medium text-right">Households</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {area.children.map((c) => (
-                    <tr key={c.name} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
-                      <td className="px-5 py-3 text-gray-800">{c.name}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <span className="tabular-nums text-gray-700 w-10 flex-shrink-0">{c.population.toLocaleString()}</span>
-                          <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden flex-1 min-w-[40px]">
-                            <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(c.population / maxChild) * 100}%` }} />
-                          </div>
-                        </div>
-                      </td>
-                      <td className="pl-4 pr-5 py-3 text-right text-gray-600 tabular-nums">{c.households.toLocaleString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )
-      ) : (
-        /* National demographic trend — only meaningful at country level */
+      {/* Area breakdown — provinces nationwide, or the children of the selected level */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
+          <h2 className="text-base font-semibold text-gray-800">{breakdown.label} of {areaName}</h2>
+          <p className="text-sm text-gray-400">Population and households within this area</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                <th className="px-5 py-3 font-medium">{breakdown.label.replace(/s$/, "")}</th>
+                <th className="px-4 py-3 font-medium w-1/2">Population</th>
+                <th className="pl-4 pr-5 py-3 font-medium text-right">Households</th>
+              </tr>
+            </thead>
+            <tbody>
+              {breakdown.rows.map((c) => (
+                <tr key={c.key} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                  <td className="px-5 py-3 text-gray-800">{c.name}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <span className="tabular-nums text-gray-700 w-10 flex-shrink-0">{c.population.toLocaleString()}</span>
+                      <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden flex-1 min-w-[40px]">
+                        <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(c.population / maxChild) * 100}%` }} />
+                      </div>
+                    </div>
+                  </td>
+                  <td className="pl-4 pr-5 py-3 text-right text-gray-600 tabular-nums">{c.households.toLocaleString()}</td>
+                </tr>
+              ))}
+              {breakdown.rows.length === 0 && (
+                <TableState
+                  colSpan={3}
+                  loading={breakdown.query.loading}
+                  message={breakdown.query.error?.message}
+                  onRetry={breakdown.query.refetch}
+                  empty="No sub-areas registered here."
+                />
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* National demographic trend — only meaningful at country level */}
+      {!scoped && (
         <>
           <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
-            <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${s.growthPct}%`} sub={`${growthUp ? "+" : ""}${s.growthAbs.toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
-            <Kpi icon={Baby} label="Births (12 mo)" value={s.births.toLocaleString()} sub={`natural increase +${s.naturalIncrease}`} tone="#10B981" />
-            <Kpi icon={Baby} label="Deaths (12 mo)" value={s.deaths.toLocaleString()} sub="registered deaths" tone="#64748B" />
-            <Kpi icon={ArrowLeftRight} label="Net migration" value={`${s.netMigration >= 0 ? "+" : ""}${s.netMigration}`} sub={`${s.movedIn} in · ${s.movedOut} out`} tone="#3752AE" />
+            <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${growthPct}%`} sub={`${growthUp ? "+" : ""}${(summary?.growth_abs ?? 0).toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
+            <Kpi icon={Baby} label="Births (12 mo)" value={(summary?.births ?? 0).toLocaleString()} sub={`natural increase +${summary?.natural_increase ?? 0}`} tone="#10B981" />
+            <Kpi icon={Baby} label="Deaths (12 mo)" value={(summary?.deaths ?? 0).toLocaleString()} sub="registered deaths" tone="#64748B" />
+            <Kpi icon={ArrowLeftRight} label="Net migration" value={`${(summary?.net_migration ?? 0) >= 0 ? "+" : ""}${summary?.net_migration ?? 0}`} sub={`${summary?.moved_in ?? 0} in · ${summary?.moved_out ?? 0} out`} tone="#3752AE" />
           </div>
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
             <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
               <h2 className="text-base font-semibold text-gray-800">Population growth</h2>
               <p className="text-sm text-gray-400 mb-3">Registered population, last 12 months</p>
               <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={changeSeries} margin={{ top: 4, right: 12, bottom: 0, left: 4 }}>
-                    <CartesianGrid vertical={false} stroke="#F1F5F9" />
-                    <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={48} domain={["dataMin - 40", "dataMax + 40"]} />
-                    <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [v.toLocaleString(), "Population"]} />
-                    <Line type="monotone" dataKey="population" stroke="#3752AE" strokeWidth={2.5} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+                {trendQuery.error ? (
+                  <div className="h-full flex flex-col items-center justify-center gap-3 text-center">
+                    <p className="text-sm text-gray-600">{trendQuery.error.message}</p>
+                    <button onClick={trendQuery.refetch} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]">Retry</button>
+                  </div>
+                ) : changeSeries.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-sm text-gray-400">
+                    {trendQuery.loading ? "Loading…" : "No trend recorded."}
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={changeSeries} margin={{ top: 4, right: 12, bottom: 0, left: 4 }}>
+                      <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                      <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={48} domain={["dataMin - 40", "dataMax + 40"]} />
+                      <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [v.toLocaleString(), "Population"]} />
+                      <Line type="monotone" dataKey="population" stroke="#3752AE" strokeWidth={2.5} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </div>
             <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
@@ -368,16 +549,22 @@ export function PopulationPage() {
                 </div>
               </div>
               <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
-                    <CartesianGrid vertical={false} stroke="#F1F5F9" />
-                    <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
-                    <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
-                    <Bar dataKey="births" name="Births" fill={BIRTH_COLOR} radius={[3, 3, 0, 0]} />
-                    <Bar dataKey="deaths" name="Deaths" fill={DEATH_COLOR} radius={[3, 3, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {changeSeries.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-sm text-gray-400">
+                    {trendQuery.loading ? "Loading…" : "No flows recorded."}
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
+                      <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                      <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
+                      <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                      <Bar dataKey="births" name="Births" fill={BIRTH_COLOR} radius={[3, 3, 0, 0]} />
+                      <Bar dataKey="deaths" name="Deaths" fill={DEATH_COLOR} radius={[3, 3, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </div>
           </div>
@@ -388,8 +575,8 @@ export function PopulationPage() {
       <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm space-y-3">
         <div className="flex flex-wrap gap-1.5">
           {([
-            { id: "citizens", label: "Citizen registry", count: citizenRows.length },
-            { id: "households", label: "Family books", count: householdRows.length },
+            { id: "citizens", label: "Citizen registry", count: citizenTotal },
+            { id: "households", label: "Family books", count: householdTotal },
           ] as const).map((t) => {
             const active = tab === t.id;
             return (
@@ -465,44 +652,58 @@ export function PopulationPage() {
                 </tr>
               </thead>
               <tbody>
-                {pageCitizens.map((c) => (
-                  <tr key={c.uin} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
-                    <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{c.uin}</td>
-                    <td className="px-4 py-3 text-gray-800">
-                      {c.name}
-                      <span className="block text-[11px] text-gray-400">{c.relation}</span>
-                    </td>
-                    <td className="px-4 py-3"><GenderDot gender={c.gender} /></td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{c.dob}</td>
-                    <td className="px-4 py-3 text-gray-600">{c.age}</td>
-                    <td className="px-4 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{c.householdNo}</td>
-                    <td className="px-4 py-3 text-gray-600">
-                      {c.village}
-                      <span className="block text-[11px] text-gray-400">{c.district}, {c.province}</span>
-                    </td>
-                    <td className="px-4 py-3"><StatusChip status={c.status} /></td>
-                    <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap">
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          onClick={() => setOpenPerson(c)}
-                          className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[110px]"
-                        >
-                          <FileText className="w-3.5 h-3.5" /> See doc
-                        </button>
-                        <button
-                          onClick={() => setOpenHousehold(HOUSEHOLDS.find((h) => h.no === c.householdNo) ?? null)}
-                          className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200 w-[110px]"
-                        >
-                          <Eye className="w-3.5 h-3.5" /> Household
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-                {totalRows === 0 && (
-                  <tr>
-                    <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">No citizens match your filters.</td>
-                  </tr>
+                {pageCitizens.map((c) => {
+                  const address = [c.jurisdiction?.district_name, c.jurisdiction?.province_name].filter(Boolean).join(", ");
+                  return (
+                    <tr key={c.id ?? c.uin} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                      <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{c.uin}</td>
+                      <td className="px-4 py-3 text-gray-800">
+                        {text(c.name)}
+                        <span className="block text-[11px] text-gray-400">{c.relation}</span>
+                      </td>
+                      <td className="px-4 py-3"><GenderDot gender={c.gender} /></td>
+                      <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{c.date_of_birth ?? "—"}</td>
+                      <td className="px-4 py-3 text-gray-600">{c.age}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{c.household_no}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {c.jurisdiction?.village_name ?? "—"}
+                        <span className="block text-[11px] text-gray-400">{address}</span>
+                      </td>
+                      <td className="px-4 py-3"><StatusChip status={c.status} /></td>
+                      <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() =>
+                              setOpenPerson({
+                                uin: c.uin,
+                                name: text(c.name),
+                                address: [c.jurisdiction?.village_name, address].filter(Boolean).join(", "),
+                              })
+                            }
+                            className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[110px]"
+                          >
+                            <FileText className="w-3.5 h-3.5" /> See doc
+                          </button>
+                          <button
+                            onClick={() => setOpenHouseholdNo(c.household_no || null)}
+                            disabled={!c.household_no}
+                            className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-40 w-[110px]"
+                          >
+                            <Eye className="w-3.5 h-3.5" /> Household
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {pageCitizens.length === 0 && (
+                  <TableState
+                    colSpan={9}
+                    loading={citizensQuery.loading}
+                    message={citizensQuery.error?.message}
+                    onRetry={citizensQuery.refetch}
+                    empty="No citizens match your filters."
+                  />
                 )}
               </tbody>
             </table>
@@ -522,17 +723,17 @@ export function PopulationPage() {
               </thead>
               <tbody>
                 {pageHouseholds.map((h) => (
-                  <tr key={h.no} onClick={() => setOpenHousehold(h)} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer">
-                    <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{h.no}</td>
-                    <td className="px-4 py-3 text-gray-800">{h.head}</td>
-                    <td className="px-4 py-3 text-gray-600">{h.members.length}</td>
-                    <td className="px-4 py-3 text-gray-600">{h.village}</td>
-                    <td className="px-4 py-3 text-gray-500">{h.district}</td>
-                    <td className="px-4 py-3 text-gray-600">{h.province}</td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{h.registered}</td>
+                  <tr key={h.id} onClick={() => setOpenHouseholdNo(h.household_no)} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer">
+                    <td className="px-5 py-3 font-mono text-xs text-gray-600 whitespace-nowrap">{h.household_no}</td>
+                    <td className="px-4 py-3 text-gray-800">{h.head_name}</td>
+                    <td className="px-4 py-3 text-gray-600">{h.total_members}</td>
+                    <td className="px-4 py-3 text-gray-600">{h.jurisdiction?.village_name ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500">{h.jurisdiction?.district_name ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-600">{h.jurisdiction?.province_name ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{h.registered_at ?? "—"}</td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                       <button
-                        onClick={() => setOpenHousehold(h)}
+                        onClick={() => setOpenHouseholdNo(h.household_no)}
                         className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] w-[110px]"
                       >
                         <Eye className="w-3.5 h-3.5" /> View
@@ -540,10 +741,14 @@ export function PopulationPage() {
                     </td>
                   </tr>
                 ))}
-                {totalRows === 0 && (
-                  <tr>
-                    <td colSpan={8} className="px-5 py-12 text-center text-sm text-gray-400">No households match your filters.</td>
-                  </tr>
+                {pageHouseholds.length === 0 && (
+                  <TableState
+                    colSpan={8}
+                    loading={householdsQuery.loading}
+                    message={householdsQuery.error?.message}
+                    onRetry={householdsQuery.refetch}
+                    empty="No households match your filters."
+                  />
                 )}
               </tbody>
             </table>
@@ -580,31 +785,48 @@ export function PopulationPage() {
       </div>
 
       {/* Family book detail */}
-      <Dialog open={openHousehold !== null} onOpenChange={(open) => !open && setOpenHousehold(null)}>
+      <Dialog open={openHouseholdNo !== null} onOpenChange={(open) => !open && setOpenHouseholdNo(null)}>
         <DialogContent className="sm:max-w-4xl w-[95vw] max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Family book {openHousehold?.no}</DialogTitle>
+            <DialogTitle>Family book {household?.household_no ?? ""}</DialogTitle>
             <DialogDescription>
-              {openHousehold ? `${openHousehold.village}, ${openHousehold.district}, ${openHousehold.province} · registered ${openHousehold.registered}` : ""}
+              {household
+                ? `${[household.jurisdiction?.village_name, household.jurisdiction?.district_name, household.jurisdiction?.province_name].filter(Boolean).join(", ")} · registered ${household.registered_at ?? "—"}`
+                : householdQuery.loading
+                  ? "Loading family book…"
+                  : ""}
             </DialogDescription>
           </DialogHeader>
 
-          {openHousehold && (
+          {householdQuery.error ? (
+            <div className="py-10 text-center">
+              <p className="text-sm text-gray-600">{householdQuery.error.message}</p>
+              <button
+                onClick={householdQuery.refetch}
+                className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+              >
+                Retry
+              </button>
+            </div>
+          ) : householdQuery.loading ? (
+            <p className="py-10 text-center text-sm text-gray-400">Loading family book…</p>
+          ) : household ? (
             <div className="space-y-4">
               <div className="grid grid-cols-3 gap-3">
                 <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-lg font-bold text-gray-800">{openHousehold.members.length}</p>
+                  <p className="text-lg font-bold text-gray-800">{household.total_members}</p>
                   <p className="text-xs text-gray-400">Members</p>
                 </div>
                 <div className="bg-gray-50 rounded-xl p-3">
                   <p className="text-lg font-bold text-gray-800">
-                    {openHousehold.members.filter((m) => m.gender === "male").length} /{" "}
-                    {openHousehold.members.filter((m) => m.gender === "female").length}
+                    {household.male_members} / {household.female_members}
                   </p>
                   <p className="text-xs text-gray-400">Male / female</p>
                 </div>
                 <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-lg font-bold text-gray-800">{openHousehold.members.filter((m) => m.age < 18).length}</p>
+                  <p className="text-lg font-bold text-gray-800">
+                    {household.members.filter((m) => (ageOf(m) ?? 99) < 18).length}
+                  </p>
                   <p className="text-xs text-gray-400">Under 18</p>
                 </div>
               </div>
@@ -623,20 +845,31 @@ export function PopulationPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {openHousehold.members.map((m) => (
-                      <tr key={m.uin} className="border-t border-gray-50">
+                    {household.members.map((m) => (
+                      <tr key={m.id ?? m.uin} className="border-t border-gray-50">
                         <td className="px-4 py-2.5 text-gray-800">
                           {m.name}
                           <span className="block font-mono text-[11px] text-gray-400">{m.uin}</span>
                         </td>
                         <td className="px-4 py-2.5 text-gray-600">{m.relation}</td>
                         <td className="px-4 py-2.5"><GenderDot gender={m.gender} /></td>
-                        <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">{m.dob}</td>
-                        <td className="px-4 py-2.5 text-gray-600">{m.age}</td>
+                        <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">{m.date_of_birth ?? "—"}</td>
+                        <td className="px-4 py-2.5 text-gray-600">{ageOf(m) ?? "—"}</td>
                         <td className="px-4 py-2.5"><StatusChip status={m.status} /></td>
                         <td className="pl-2 pr-4 py-2.5 w-px">
                           <button
-                            onClick={() => { setOpenHousehold(null); setOpenPerson(m); }}
+                            onClick={() => {
+                              setOpenHouseholdNo(null);
+                              setOpenPerson({
+                                uin: m.uin,
+                                name: m.name,
+                                address: [
+                                  household.jurisdiction?.village_name,
+                                  household.jurisdiction?.district_name,
+                                  household.jurisdiction?.province_name,
+                                ].filter(Boolean).join(", "),
+                              });
+                            }}
                             title="See documents"
                             className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-[#3752AE] hover:bg-[#3752AE]/10"
                           >
@@ -649,7 +882,7 @@ export function PopulationPage() {
                 </table>
               </div>
             </div>
-          )}
+          ) : null}
         </DialogContent>
       </Dialog>
     </div>

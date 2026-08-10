@@ -4,7 +4,9 @@ import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";
 import type { Map as LeafletMap, Layer, LeafletMouseEvent, PathOptions } from "leaflet";
 import type { Feature, FeatureCollection } from "geojson";
 import "leaflet/dist/leaflet.css";
-import { PROVINCE_STATS } from "../data/mockData";
+import { registry } from "../api/endpoints";
+import { useQuery } from "../api/hooks";
+import type { MapProvince } from "../api/types";
 
 /* Choropleth colour ramp (brand blue), low → high. Shaded by each province's
  * value relative to the busiest one, so any metric (registrations, population…)
@@ -21,6 +23,25 @@ function shade(v: number, max: number): string {
 const DEFAULT_CENTER: [number, number] = [18.2, 104.3];
 const DEFAULT_ZOOM = 5;
 
+export type MapMetric = "population" | "households" | "applications" | "issued" | "revenue";
+
+/**
+ * The province map endpoint answers with the rows plus the metric it applied;
+ * older deployments answered with the bare array. Accept both.
+ */
+export function mapProvinceRows(payload: unknown): MapProvince[] {
+  if (Array.isArray(payload)) return payload as MapProvince[];
+  const rows = (payload as { rows?: unknown } | null | undefined)?.rows;
+  return Array.isArray(rows) ? (rows as MapProvince[]) : [];
+}
+
+/** geo_name → value, which is how a GeoJSON feature is matched to a row. */
+export function mapValues(rows: MapProvince[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const row of rows) out[row.geo_name || row.province] = row.value ?? 0;
+  return out;
+}
+
 interface MapHover {
   name: string;
   value: number;
@@ -31,8 +52,10 @@ interface MapHover {
 export interface LaosMapProps {
   fill?: boolean;
   zoom?: number;
-  /** Metric to colour by (province → value). Defaults to registration counts. */
+  /** Metric to colour by (province → value). When omitted the map loads its own. */
   values?: Record<string, number>;
+  /** Which server-side metric to load when `values` is not supplied. */
+  metric?: MapMetric;
   valueLabel?: string;
   /** Controlled selection — when provided, selection is driven by the parent. */
   selected?: string | null;
@@ -45,6 +68,7 @@ export function LaosMap({
   fill = false,
   zoom = DEFAULT_ZOOM,
   values,
+  metric = "applications",
   valueLabel = "Registrations",
   selected,
   onSelect,
@@ -60,9 +84,18 @@ export function LaosMap({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const layersRef = useRef<Record<string, any>>({});
 
+  // Only the uncontrolled-metric case fetches; a parent that passes `values`
+  // already has the rows and does not need a second request.
+  const provincesQuery = useQuery(
+    (signal) => registry.mapProvinces({ metric }, signal),
+    [metric],
+    { enabled: values === undefined },
+  );
+
   const controlled = onSelect !== undefined;
   const active = controlled ? selected ?? null : internalActive;
-  const vals = values ?? PROVINCE_STATS;
+  const fetched = useMemo(() => mapValues(mapProvinceRows(provincesQuery.data)), [provincesQuery.data]);
+  const vals = values ?? fetched;
   const maxVal = useMemo(() => Math.max(1, ...Object.values(vals)), [vals]);
   const list = useMemo(() => Object.entries(vals).sort((a, b) => b[1] - a[1]), [vals]);
   const valueOf = (name?: string) => (name && vals[name]) || 0;
@@ -138,6 +171,20 @@ export function LaosMap({
     return (
       <div className={`${fill ? "h-full" : "h-[380px]"} flex items-center justify-center text-sm text-gray-400`}>
         Could not load the map data.
+      </div>
+    );
+  }
+
+  if (provincesQuery.error) {
+    return (
+      <div className={`${fill ? "h-full" : "h-[380px]"} flex flex-col items-center justify-center gap-3 text-center`}>
+        <p className="text-sm text-gray-600">{provincesQuery.error.message}</p>
+        <button
+          onClick={provincesQuery.refetch}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b]"
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -223,6 +270,11 @@ export function LaosMap({
                 </button>
               );
             })}
+            {list.length === 0 && (
+              <p className="px-3.5 py-8 text-center text-sm text-gray-400">
+                {provincesQuery.loading ? "Loading…" : "No data for this metric."}
+              </p>
+            )}
           </div>
         </div>
       )}

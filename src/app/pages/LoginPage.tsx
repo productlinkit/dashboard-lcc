@@ -1,25 +1,46 @@
 import { useState } from "react";
-import { Mail, Lock, Eye, EyeOff, LogIn, AlertCircle } from "lucide-react";
+import { Mail, Lock, Eye, EyeOff, LogIn, AlertCircle, Loader2 } from "lucide-react";
 import logoLcc from "../../imports/logo-lcc.png";
+import { auth } from "../api/endpoints";
+import { useMutation } from "../api/hooks";
+import type { OfficerSession } from "../api/types";
 
-/* Demo credentials (no registration). */
-const VALID_EMAIL = "admin@gmail.com";
-const VALID_PASSWORD = "l1nk1t360";
+/* Seeded back-office accounts — offered as a hint so a reviewer can sign in
+ * without hunting for credentials. They all share one password. */
+const DEMO_PASSWORD = "Password@123";
+const DEMO_ACCOUNTS: { email: string; role: string }[] = [
+  { email: "admin@lcc.gov.la", role: "System administrator" },
+  { email: "supervisor@lcc.gov.la", role: "Supervisor" },
+  { email: "registrar@lcc.gov.la", role: "District registrar" },
+  { email: "chief@lcc.gov.la", role: "Village chief" },
+  { email: "officer@lcc.gov.la", role: "Village officer" },
+  { email: "dops@lcc.gov.la", role: "DoPS officer" },
+];
 
-export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
+export function LoginPage({ onSuccess }: { onSuccess: (session: OfficerSession) => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
-  const [error, setError] = useState("");
 
-  function submit(e: React.FormEvent) {
+  const login = useMutation((body: { email: string; password: string }) => auth.login(body));
+  const error = login.error?.message ?? "";
+
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (email.trim().toLowerCase() === VALID_EMAIL && password === VALID_PASSWORD) {
-      setError("");
-      onSuccess();
-    } else {
-      setError("Invalid email or password.");
+    if (login.pending) return;
+    try {
+      // App hands us useSession().signIn, which wants the whole session object.
+      const session = await login.run({ email: email.trim(), password });
+      onSuccess(session);
+    } catch {
+      /* the message is already on login.error */
     }
+  }
+
+  function useDemo(demoEmail: string) {
+    setEmail(demoEmail);
+    setPassword(DEMO_PASSWORD);
+    login.reset();
   }
 
   return (
@@ -55,7 +76,7 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="admin@gmail.com"
+              placeholder="officer@lcc.gov.la"
               autoComplete="email"
               className="flex-1 bg-transparent outline-none text-sm text-gray-700 placeholder:text-gray-400"
             />
@@ -85,10 +106,32 @@ export function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 
           <button
             type="submit"
-            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-[#3752AE] text-white hover:bg-[#2c428b] transition-all"
+            disabled={login.pending || !email.trim() || !password}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-[#3752AE] text-white hover:bg-[#2c428b] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <LogIn className="w-4 h-4" /> Sign in
+            {login.pending ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
+            {login.pending ? "Signing in…" : "Sign in"}
           </button>
+
+          {/* Demo accounts */}
+          <div className="mt-6 pt-4 border-t border-gray-100">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 mb-2">
+              Demo accounts · password {DEMO_PASSWORD}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {DEMO_ACCOUNTS.map((a) => (
+                <button
+                  key={a.email}
+                  type="button"
+                  onClick={() => useDemo(a.email)}
+                  title={`${a.role} — ${a.email}`}
+                  className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-600 hover:bg-[#3752AE]/10 hover:text-[#3752AE] transition-colors"
+                >
+                  {a.email.split("@")[0]}
+                </button>
+              ))}
+            </div>
+          </div>
         </form>
       </div>
     </div>

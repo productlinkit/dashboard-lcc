@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, Eye, Download, ChevronLeft, ChevronRight } from "lucide-react";
-import { APPLICATIONS, STATUS_ORDER, STATUS_META, lastActivityOf, daysAgo } from "../data/mockData";
+import { Search, Eye, Download, ChevronLeft, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { STATUS_ORDER, STATUS_META, type AppStatus } from "../data/mockData";
 import { SERVICES, SERVICE_BY_ID } from "../serviceConfig";
-import { paymentStateFor, PAYMENT_STATE_META, PAYMENT_OPTIONS } from "../data/payments";
+import { PAYMENT_STATE_META, PAYMENT_OPTIONS, type PaymentState } from "../data/payments";
 import { StatusBadge } from "../components/StatusBadge";
 import { MultiSelectFilter } from "../components/MultiSelectFilter";
-import { DateRangeFilter, inRange, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
+import { DateRangeFilter, ALL_TIME, type DateRange } from "../components/DateRangeFilter";
+import { applications } from "../api/endpoints";
+import { useDebounced, useQuery } from "../api/hooks";
+import { text, type ApplicationRow } from "../api/types";
 
 const SERVICE_OPTIONS = SERVICES.map((s) => ({ value: s.id, label: s.label, color: s.color }));
 const STATUS_OPTIONS = STATUS_ORDER.map((s) => ({ value: s, label: STATUS_META[s].label, color: STATUS_META[s].color }));
@@ -15,39 +18,25 @@ const STATUS_OPTIONS = STATUS_ORDER.map((s) => ({ value: s, label: STATUS_META[s
 const OPEN_STATUSES = new Set(["draft", "submitted", "certified", "under-review", "returned"]);
 const STALE_DAYS = 14;
 
-function relativeDays(date: string): string {
-  const d = daysAgo(date);
+/** Whole days between an RFC3339 timestamp and now. */
+function daysSince(iso?: string): number {
+  if (!iso) return 0;
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 0;
+  return Math.max(0, Math.floor((Date.now() - then) / 86_400_000));
+}
+
+function relativeDays(iso?: string): string {
+  if (!iso) return "—";
+  const d = daysSince(iso);
   if (d === 0) return "Today";
   if (d === 1) return "Yesterday";
   if (d < 30) return `${d}d ago`;
-  return date;
+  return iso.slice(0, 10);
 }
 
-function exportCsv(rows: typeof APPLICATIONS) {
-  const header = ["Ref No", "Applicant", "Service", "Province", "Submitted", "Last activity", "Payment", "Officer", "Status"];
-  const body = rows.map((a) => [
-    a.id,
-    a.applicant,
-    SERVICE_BY_ID[a.serviceId]?.label ?? a.serviceId,
-    a.province,
-    a.submitted,
-    lastActivityOf(a),
-    PAYMENT_STATE_META[paymentStateFor(a.id)].label,
-    a.officer ?? "",
-    STATUS_META[a.status].label,
-  ]);
-  const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
-  const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `applications-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function PaymentChip({ appId }: { appId: string }) {
-  const m = PAYMENT_STATE_META[paymentStateFor(appId)];
+function PaymentChip({ state }: { state: PaymentState }) {
+  const m = PAYMENT_STATE_META[state] ?? PAYMENT_STATE_META.free;
   return (
     <span
       className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap"
@@ -65,30 +54,57 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
   const [payments, setPayments] = useState<string[]>([]);
   const [dateRange, setDateRange] = useState<DateRange>(ALL_TIME);
   const [query, setQuery] = useState("");
+  const search = useDebounced(query, 350);
 
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const [exporting, setExporting] = useState(false);
 
-  const rows = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return APPLICATIONS.filter((a) => {
-      if (statuses.length && !statuses.includes(a.status)) return false;
-      if (services.length && !services.includes(a.serviceId)) return false;
-      if (payments.length && !payments.includes(paymentStateFor(a.id))) return false;
-      if (!inRange(a.submitted, dateRange)) return false;
-      if (q && !`${a.id} ${a.applicant} ${a.province}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [services, statuses, payments, dateRange, query]);
+  // Reset to the first page whenever the result set or page size changes.
+  useEffect(() => setPage(1), [services, statuses, payments, dateRange, search, pageSize]);
 
-  // Reset to first page whenever the result set or page size changes.
-  useEffect(() => setPage(1), [services, statuses, payments, dateRange, query, pageSize]);
+  /* Everything is filtered server-side: the browser never holds more than one
+   * page of rows. */
+  const filters = useMemo(
+    () => ({
+      status: statuses,
+      service_code: services,
+      payment_state: payments,
+      date_from: dateRange.from,
+      date_to: dateRange.to,
+      search: search.trim(),
+    }),
+    [statuses, services, payments, dateRange.from, dateRange.to, search],
+  );
+  const filterKey = JSON.stringify(filters);
 
-  const totalRows = rows.length;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const currentPage = Math.min(page, totalPages);
+  const listQuery = useQuery(
+    (signal) => applications.list({ ...filters, page, per_page: pageSize, sort: "-created_at" }, signal),
+    [filterKey, page, pageSize],
+  );
+  const summaryQuery = useQuery((signal) => applications.summary(filters, signal), [filterKey]);
+
+  const rows: ApplicationRow[] = listQuery.data?.data ?? [];
+  const meta = listQuery.data?.meta;
+  const totalRows = summaryQuery.data?.total ?? meta?.total ?? 0;
+  const totalPages = Math.max(1, meta?.total_pages ?? 1);
+  const currentPage = meta?.page ?? page;
   const start = (currentPage - 1) * pageSize;
-  const pageRows = rows.slice(start, start + pageSize);
+
+  async function exportCsv() {
+    setExporting(true);
+    try {
+      const csv = await applications.exportCSV({ ...filters, sort: "-created_at" });
+      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `applications-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <div className="max-w-screen-2xl mx-auto space-y-4">
@@ -101,10 +117,12 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
           </p>
         </div>
         <button
-          onClick={() => exportCsv(rows)}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto"
+          onClick={exportCsv}
+          disabled={exporting}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[#3752AE] text-white hover:bg-[#2c428b] self-start sm:self-auto disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <Download className="w-4 h-4" /> Export
+          {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+          {exporting ? "Exporting…" : "Export"}
         </button>
       </div>
 
@@ -134,7 +152,12 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h2 className="text-base font-semibold text-gray-800">
-            {totalRows} application{totalRows !== 1 ? "s" : ""}
+            {totalRows.toLocaleString()} application{totalRows !== 1 ? "s" : ""}
+            {summaryQuery.data && summaryQuery.data.overdue > 0 && (
+              <span className="ml-2 text-sm font-medium text-red-500">
+                · {summaryQuery.data.overdue.toLocaleString()} overdue
+              </span>
+            )}
           </h2>
           <div className="flex items-center gap-2 text-sm text-gray-500">
             <span className="hidden sm:inline">Rows</span>
@@ -168,10 +191,10 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
               </tr>
             </thead>
             <tbody>
-              {pageRows.map((a) => {
-                const svc = SERVICE_BY_ID[a.serviceId];
-                const activity = lastActivityOf(a);
-                const idle = daysAgo(activity);
+              {rows.map((a) => {
+                const svc = SERVICE_BY_ID[a.service_code];
+                const activity = a.updated_at || a.created_at;
+                const idle = daysSince(activity);
                 const stale = OPEN_STATUSES.has(a.status) && idle >= STALE_DAYS;
                 return (
                   <tr
@@ -179,28 +202,33 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                     onClick={() => onOpenCase(a.id)}
                     className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 cursor-pointer"
                   >
-                    <td className="px-5 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{a.id}</td>
+                    <td className="px-5 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">{a.reference_no}</td>
                     <td className="px-4 py-3 text-gray-800">{a.applicant}</td>
                     <td className="px-4 py-3">
                       <span className="inline-flex items-center gap-2 text-gray-600 whitespace-nowrap">
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color }} />
-                        {svc?.short}
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: svc?.color ?? "#94A3B8" }} />
+                        {svc?.short ?? text(a.service_name)}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-gray-600">{a.province}</td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{a.submitted}</td>
+                    <td className="px-4 py-3 text-gray-600">{a.jurisdiction?.province_name ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
+                      {(a.submitted_at ?? a.created_at ?? "").slice(0, 10) || "—"}
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap">
-                      <span className={stale ? "text-red-600 font-medium" : "text-gray-500"} title={stale ? `No activity for ${idle} days` : activity}>
+                      <span
+                        className={stale ? "text-red-600 font-medium" : "text-gray-500"}
+                        title={stale ? `No activity for ${idle} days` : activity?.slice(0, 10)}
+                      >
                         {relativeDays(activity)}
                       </span>
                       {stale && <span className="block text-[11px] text-red-400">stale</span>}
                     </td>
                     <td className="px-4 py-3">
-                      <PaymentChip appId={a.id} />
+                      <PaymentChip state={a.payment_state as PaymentState} />
                     </td>
-                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{a.officer ?? "—"}</td>
+                    <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{a.assigned_officer ?? "—"}</td>
                     <td className="px-4 py-3">
-                      <StatusBadge status={a.status} />
+                      <StatusBadge status={a.status as AppStatus} />
                     </td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                       <button
@@ -213,7 +241,32 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
                   </tr>
                 );
               })}
-              {totalRows === 0 && (
+
+              {listQuery.loading && (
+                <tr>
+                  <td colSpan={10} className="px-5 py-12 text-center text-sm text-gray-400">
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Loading applications…
+                    </span>
+                  </td>
+                </tr>
+              )}
+
+              {!listQuery.loading && listQuery.error && (
+                <tr>
+                  <td colSpan={10} className="px-5 py-12 text-center">
+                    <p className="text-sm text-red-600">{listQuery.error.message}</p>
+                    <button
+                      onClick={listQuery.refetch}
+                      className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" /> Retry
+                    </button>
+                  </td>
+                </tr>
+              )}
+
+              {!listQuery.loading && !listQuery.error && rows.length === 0 && (
                 <tr>
                   <td colSpan={10} className="px-5 py-12 text-center text-sm text-gray-400">
                     No applications match your filters.
@@ -225,12 +278,12 @@ export function ApplicationsPage({ onOpenCase }: { onOpenCase: (id: string) => v
         </div>
 
         {/* Pagination */}
-        {totalRows > 0 && (
+        {rows.length > 0 && meta && (
           <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-gray-100">
             <p className="text-sm text-gray-500">
               Showing <span className="font-medium text-gray-700">{start + 1}</span>–
-              <span className="font-medium text-gray-700">{Math.min(start + pageSize, totalRows)}</span> of{" "}
-              <span className="font-medium text-gray-700">{totalRows}</span>
+              <span className="font-medium text-gray-700">{start + rows.length}</span> of{" "}
+              <span className="font-medium text-gray-700">{meta.total.toLocaleString()}</span>
             </p>
             <div className="flex items-center gap-2">
               <button

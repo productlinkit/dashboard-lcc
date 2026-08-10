@@ -31,3 +31,13 @@ declare module "figma:asset/*" {
   const src: string;
   export default src;
 }
+
+// Environment variables the dashboard reads. VITE_API_URL points at the Go
+// backend; it defaults to http://localhost:8080/api/v1 when unset.
+interface ImportMetaEnv {
+  readonly VITE_API_URL?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}

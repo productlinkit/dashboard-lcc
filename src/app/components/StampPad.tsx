@@ -27,6 +27,12 @@ export interface Stamp {
   rotation: number;
   x: number | null;
   y: number | null;
+  /*
+   * The stamp flattened to a PNG data-URL. A preset is drawn with DOM elements
+   * on the certificate, but a workflow transition can only carry an image, so
+   * the same mark is rasterised here and sent as `stamp_data_url`.
+   */
+  dataUrl?: string;
 }
 
 export const STAMP_COLORS = [
@@ -43,6 +49,54 @@ const PRESETS: { label: string; line1: string; line2: string }[] = [
 ];
 
 export const DEFAULT_STAMP_SIZE = 108;
+
+/*
+ * Rasterise a preset stamp: the same two concentric rings, two lines of text
+ * and star that StampMark renders, drawn at 2× for a crisp PNG.
+ */
+function presetToPng(stamp: Stamp): string {
+  const { size, rotation, color } = stamp;
+  const dpr = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = size * dpr;
+  canvas.height = size * dpr;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+
+  ctx.scale(dpr, dpr);
+  ctx.translate(size / 2, size / 2);
+  ctx.rotate((rotation * Math.PI) / 180);
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(0, 0, size / 2 - 1.5, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(0, 0, (size - 14) / 2 - 0.5, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.font = `600 ${size * 0.115}px system-ui, sans-serif`;
+  ctx.fillText(stamp.line1, 0, -size * 0.11, size - 26);
+  ctx.font = `500 ${size * 0.085}px system-ui, sans-serif`;
+  ctx.fillText(stamp.line2, 0, size * 0.01, size - 26);
+  ctx.font = `${size * 0.13}px system-ui, sans-serif`;
+  ctx.fillText("★", 0, size * 0.13);
+
+  return canvas.toDataURL("image/png");
+}
+
+/** The PNG data-URL for a stamp — what a transition sends as `stamp_data_url`. */
+export function stampDataUrl(stamp: Stamp | null | undefined): string {
+  if (!stamp) return "";
+  if (stamp.dataUrl) return stamp.dataUrl;
+  return stamp.kind === "image" ? stamp.data : presetToPng(stamp);
+}
 
 /** Renders one stamp at its configured size, colour and rotation. */
 export function StampMark({ stamp }: { stamp: Stamp }) {
@@ -94,10 +148,13 @@ export function StampPad({
   open,
   onClose,
   onApply,
+  onChange,
 }: {
   open: boolean;
   onClose: () => void;
   onApply: (s: Stamp) => void;
+  /** Fires with the same stamp as onApply — kept for callers that only need the PNG. */
+  onChange?: (dataUrl: string, s: Stamp) => void;
 }) {
   const [tab, setTab] = useState<"preset" | "image">("preset");
   const [preset, setPreset] = useState(0);
@@ -151,7 +208,10 @@ export function StampPad({
   function apply() {
     if (!canApply) return;
     stampSeq += 1;
-    onApply({ ...draft, id: `stamp-${stampSeq}` });
+    const stamp: Stamp = { ...draft, id: `stamp-${stampSeq}` };
+    stamp.dataUrl = stampDataUrl(stamp);
+    onApply(stamp);
+    onChange?.(stamp.dataUrl, stamp);
     onClose();
   }
 
