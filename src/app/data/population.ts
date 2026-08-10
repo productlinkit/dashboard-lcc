@@ -11,6 +11,7 @@ import { hashStr } from "./derive";
 export type Gender = "male" | "female";
 export type CitizenStatus = "active" | "deceased" | "moved";
 export type Nationality = "Lao" | "Foreign";
+export type MaritalStatus = "single" | "married" | "widowed" | "divorced";
 
 export interface Citizen {
   uin: string; // Unique Identification Number
@@ -25,7 +26,16 @@ export interface Citizen {
   householdNo: string;
   status: CitizenStatus;
   nationality: Nationality;
+  maritalStatus: MaritalStatus;
 }
+
+export const MARITAL_META: Record<MaritalStatus, { label: string; color: string }> = {
+  single: { label: "Single", color: "#3752AE" },
+  married: { label: "Married", color: "#10B981" },
+  divorced: { label: "Divorced", color: "#F59E0B" },
+  widowed: { label: "Widowed", color: "#64748B" },
+};
+export const MARITAL_ORDER: MaritalStatus[] = ["single", "married", "divorced", "widowed"];
 
 export interface Household {
   no: string; // family book number
@@ -123,6 +133,26 @@ function buildHouseholds(count: number): Household[] {
     const composition = COMPOSITIONS[Math.floor(rnd() * COMPOSITIONS.length)];
     // Foreign residents are registered as whole households, and are rare (~2%).
     const nationality: Nationality = rnd() < 0.02 ? "Foreign" : "Lao";
+    // If the household has a spouse, the head and that spouse are married.
+    const headHasSpouse = composition.some((s) => s.relation === "Spouse");
+
+    // Marital status by relation and age — minors are always single.
+    const maritalFor = (relation: string, age: number): MaritalStatus => {
+      if (age < 18) return "single";
+      if (relation === "Spouse") return "married";
+      if (relation === "Head") {
+        if (headHasSpouse) return "married";
+        const r = rnd();
+        return r < 0.4 ? "single" : r < 0.7 ? "widowed" : "divorced";
+      }
+      if (relation === "Parent") {
+        const r = rnd();
+        return r < 0.55 ? "widowed" : r < 0.9 ? "married" : "divorced";
+      }
+      // Adult child / sibling: mostly single, some married or divorced.
+      const r = rnd();
+      return r < 0.62 ? "single" : r < 0.87 ? "married" : "divorced";
+    };
 
     const regDaysAgo = Math.floor(rnd() * 2200); // registered over the last ~6 years
     const regDate = new Date(TODAY);
@@ -151,6 +181,7 @@ function buildHouseholds(count: number): Household[] {
         householdNo: no,
         status,
         nationality,
+        maritalStatus: maritalFor(relation, age),
       });
     };
 
@@ -188,6 +219,8 @@ export interface DemoMonth {
   month: string;
   births: number;
   deaths: number;
+  marriages: number;
+  divorces: number;
   movedIn: number;
   movedOut: number;
   population: number;
@@ -198,6 +231,8 @@ function buildDemographicTrend(): DemoMonth[] {
   const flows = Array.from({ length: 12 }, () => ({
     births: 20 + Math.floor(rnd() * 14), // 20–33
     deaths: 10 + Math.floor(rnd() * 8), // 10–17
+    marriages: 14 + Math.floor(rnd() * 12), // 14–25
+    divorces: 3 + Math.floor(rnd() * 6), // 3–8
     movedIn: 8 + Math.floor(rnd() * 8), // 8–15
     movedOut: 6 + Math.floor(rnd() * 7), // 6–11
   }));
@@ -266,10 +301,18 @@ function buildRegionStats(): RegionStat[] {
 
 export const REGION_STATS: RegionStat[] = buildRegionStats();
 
+/* Marital-status counts over a set of citizens (adults are the ones that vary). */
+export function maritalBreakdown(citizens: Citizen[]): Record<MaritalStatus, number> {
+  const out: Record<MaritalStatus, number> = { single: 0, married: 0, divorced: 0, widowed: 0 };
+  for (const c of citizens) out[c.maritalStatus] += 1;
+  return out;
+}
+
 /* ── Aggregates used by the page header ── */
 const workingAge = CITIZENS.filter(isWorkingAge).length;
 const dependents = CITIZENS.length - workingAge;
 const foreign = CITIZENS.filter((c) => c.nationality === "Foreign").length;
+const marital = maritalBreakdown(CITIZENS);
 
 export const POPULATION_SUMMARY = {
   citizens: CITIZENS.length,
@@ -296,6 +339,13 @@ export const POPULATION_SUMMARY = {
   naturalIncrease: sum("births") - sum("deaths"),
   growthAbs: popEnd - popStart,
   growthPct: popStart ? +(((popEnd - popStart) / popStart) * 100).toFixed(1) : 0,
+  // Marital status (whole population) and marriage/divorce events over 12 months
+  married: marital.married,
+  single: marital.single,
+  divorced: marital.divorced,
+  widowed: marital.widowed,
+  marriages: sum("marriages"),
+  divorces: sum("divorces"),
 };
 
 export const AGE_BANDS = [
@@ -339,6 +389,7 @@ export interface AreaStat {
   minors: number;
   seniors: number;
   foreign: number;
+  marital: Record<MaritalStatus, number>;
   ageBands: { band: string; male: number; female: number }[];
   childLabel: string; // what the children are ("Provinces", "Districts"…)
   children: AreaChild[];
@@ -395,6 +446,7 @@ export function areaStat(province?: string | null, district?: string | null, vil
     minors: cz.filter((c) => c.age < 18).length,
     seniors: cz.filter((c) => c.age >= 60).length,
     foreign: cz.filter((c) => c.nationality === "Foreign").length,
+    marital: maritalBreakdown(cz),
     ageBands: ageDistribution(cz),
     childLabel,
     children,

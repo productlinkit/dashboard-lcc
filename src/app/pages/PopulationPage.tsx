@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
-  PieChart, Pie, Cell,
+  BarChart, Bar, LineChart, Line, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  PieChart, Pie, Cell, ReferenceLine,
 } from "recharts";
 import {
   Search, Users, Home, Briefcase, TrendingUp, TrendingDown, Baby, Globe, ArrowLeftRight,
-  Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download,
+  Heart, HeartCrack, Eye, FileText, ArrowLeft, ChevronLeft, ChevronRight, Download,
 } from "lucide-react";
 import {
   CITIZENS,
@@ -13,6 +13,8 @@ import {
   POPULATION_SUMMARY,
   DEMOGRAPHIC_TREND,
   WORKING_AGE,
+  MARITAL_META,
+  MARITAL_ORDER,
   areaStat,
   type Citizen,
   type Household,
@@ -23,6 +25,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "../components/ui/dialog";
 import { PersonRecord } from "../components/PersonRecord";
+import { hashStr } from "../data/derive";
 
 const MALE_COLOR = "#3752AE";
 const FEMALE_COLOR = "#EC4899";
@@ -87,10 +90,10 @@ function GenderDot({ gender }: { gender: string }) {
 }
 
 function exportCitizens(rows: Citizen[]) {
-  const header = ["UIN", "Name", "Gender", "Date of birth", "Age", "Household", "Village", "District", "Province", "Status"];
+  const header = ["UIN", "Name", "Gender", "Date of birth", "Age", "Household", "Village", "District", "Province", "Marital", "Status"];
   const body = rows.map((c) => [
     c.uin, c.name, c.gender, c.dob, String(c.age), c.householdNo, c.village, c.district, c.province,
-    STATUS_META[c.status].label,
+    MARITAL_META[c.maritalStatus].label, STATUS_META[c.status].label,
   ]);
   const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
   const csv = [header, ...body].map((r) => r.map(escape).join(",")).join("\n");
@@ -161,20 +164,67 @@ export function PopulationPage() {
     { name: "Lao nationals", value: area.population - area.foreign, color: LOCAL_COLOR },
     { name: "Foreign residents", value: area.foreign, color: FOREIGN_COLOR },
   ];
+  const maritalData = MARITAL_ORDER.map((k) => ({ name: MARITAL_META[k].label, value: area.marital[k], color: MARITAL_META[k].color }));
   const avgHousehold = area.households ? area.population / area.households : 0;
   const workingPct = area.population ? Math.round((area.workingAge / area.population) * 100) : 0;
   const maxChild = area.children[0]?.population ?? 1;
 
-  const s = POPULATION_SUMMARY;
+  // Vital & migration trend. The national figures are the only monthly series we
+  // hold, so when an area is selected we estimate its trend from its share of the
+  // national population — the shape holds and the totals reconcile to the area.
+  const share = POPULATION_SUMMARY.citizens ? area.population / POPULATION_SUMMARY.citizens : 0;
+  // Population line is large, so plain rounding is fine. Monthly flows are small
+  // nationally (divorces 3–8, deaths 10–17), so a small area's share rounds them
+  // to 0 and leaves empty bars. Instead, vary each flow deterministically around
+  // its scaled mean (0.5×–1.6×) so months differ; never let it fall to 0.
+  const scalePop = (n: number) => (scoped ? Math.round(n * share) : n);
+  const scaleFlow = (n: number, key: string, i: number) => {
+    if (!scoped) return n;
+    const jitter = (hashStr(`${area.name}|${key}|${i}`) % 1000) / 1000; // 0–1, stable per area/metric/month
+    const v = Math.round(n * share * (0.5 + jitter * 1.1));
+    if (v >= 1) return v;
+    // Area so small the scaled mean is below 1 — still show a realistic 1–2.
+    return (hashStr(`${area.name}|${key}|${i}|lo`) % 100) < 75 ? 1 : 2;
+  };
+  const changeSeries = DEMOGRAPHIC_TREND.map((m, i) => {
+    const movedIn = scaleFlow(m.movedIn, "movedIn", i);
+    const movedOut = scaleFlow(m.movedOut, "movedOut", i);
+    return {
+      month: m.month,
+      births: scaleFlow(m.births, "births", i),
+      deaths: scaleFlow(m.deaths, "deaths", i),
+      marriages: scaleFlow(m.marriages, "marriages", i),
+      divorces: scaleFlow(m.divorces, "divorces", i),
+      movedIn,
+      movedOut,
+      net: movedIn - movedOut,
+      population: scalePop(m.population),
+    };
+  });
+  const sumSeries = (k: keyof (typeof changeSeries)[number]) =>
+    changeSeries.reduce((a, m) => a + (m[k] as number), 0);
+  const popFirst = changeSeries[0].population;
+  const popLast = changeSeries[changeSeries.length - 1].population;
+  // Summary KPIs — national totals, or the area's share when scoped.
+  const s = scoped
+    ? {
+        births: sumSeries("births"),
+        deaths: sumSeries("deaths"),
+        marriages: sumSeries("marriages"),
+        divorces: sumSeries("divorces"),
+        movedIn: sumSeries("movedIn"),
+        movedOut: sumSeries("movedOut"),
+        netMigration: sumSeries("movedIn") - sumSeries("movedOut"),
+        naturalIncrease: sumSeries("births") - sumSeries("deaths"),
+        growthAbs: popLast - popFirst,
+        growthPct: popFirst ? +(((popLast - popFirst) / popFirst) * 100).toFixed(1) : 0,
+        married: area.marital.married,
+        single: area.marital.single,
+        divorced: area.marital.divorced,
+        widowed: area.marital.widowed,
+      }
+    : POPULATION_SUMMARY;
   const growthUp = s.growthPct >= 0;
-  const changeSeries = DEMOGRAPHIC_TREND.map((m) => ({
-    month: m.month,
-    births: m.births,
-    deaths: m.deaths,
-    movedIn: m.movedIn,
-    movedOut: m.movedOut,
-    population: m.population,
-  }));
 
   /* Opening a citizen replaces the page, the same way Watchlist Search does. */
   if (openPerson) {
@@ -230,19 +280,26 @@ export function PopulationPage() {
 
       {/* Age & gender + composition (scoped) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {area.name}</h2>
-          <p className="text-sm text-gray-400 mb-3">Registered population by age band · working age {WORKING_AGE.from}–{WORKING_AGE.to}</p>
-          <div className="h-64">
+        <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
+          <div className="flex items-start justify-between gap-4 flex-shrink-0">
+            <div>
+              <h2 className="text-base font-semibold text-gray-800">Age &amp; gender — {area.name}</h2>
+              <p className="text-sm text-gray-400">Registered population by age band · working age {WORKING_AGE.from}–{WORKING_AGE.to}</p>
+            </div>
+            <div className="flex items-center gap-3 text-xs flex-shrink-0">
+              <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: MALE_COLOR }} /> Male</span>
+              <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: FEMALE_COLOR }} /> Female</span>
+            </div>
+          </div>
+          <div className="flex-1 min-h-[280px] mt-3">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={area.ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2}>
+              <BarChart data={area.ageBands} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barCategoryGap="26%" barGap={4}>
                 <CartesianGrid horizontal={false} stroke="#F1F5F9" />
                 <XAxis type="number" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
                 <YAxis type="category" dataKey="band" tick={{ fill: "#64748B", fontSize: 12 }} axisLine={false} tickLine={false} width={52} />
                 <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
-                <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
-                <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} barSize={14} />
+                <Bar dataKey="male" name="Male" fill={MALE_COLOR} radius={[0, 4, 4, 0]} maxBarSize={18} />
+                <Bar dataKey="female" name="Female" fill={FEMALE_COLOR} radius={[0, 4, 4, 0]} maxBarSize={18} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -250,11 +307,12 @@ export function PopulationPage() {
 
         <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
           <h2 className="text-base font-semibold text-gray-800">Composition</h2>
-          <p className="text-sm text-gray-400">Gender and nationality</p>
+          <p className="text-sm text-gray-400">Gender, nationality and marital status</p>
           <div className="flex-1 flex flex-col justify-center divide-y divide-gray-50 mt-1">
             {[
               { title: "Gender", data: genderData },
               { title: "Nationality", data: originData },
+              { title: "Marital status", data: maritalData },
             ].map((dd) => {
               const total = dd.data.reduce((a, e) => a + e.value, 0);
               return (
@@ -293,56 +351,57 @@ export function PopulationPage() {
         </div>
       </div>
 
-      {scoped ? (
-        /* Area breakdown — the children of the selected level */
-        area.children.length > 0 && (
-          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-            <div className="px-5 py-4 border-b border-gray-100">
-              <h2 className="text-base font-semibold text-gray-800">{area.childLabel} of {area.name}</h2>
-              <p className="text-sm text-gray-400">Population and households within this area</p>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
-                    <th className="px-5 py-3 font-medium">{area.childLabel.replace(/s$/, "")}</th>
-                    <th className="px-4 py-3 font-medium w-1/2">Population</th>
-                    <th className="pl-4 pr-5 py-3 font-medium text-right">Households</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {area.children.map((c) => (
-                    <tr key={c.name} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
-                      <td className="px-5 py-3 text-gray-800">{c.name}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <span className="tabular-nums text-gray-700 w-10 flex-shrink-0">{c.population.toLocaleString()}</span>
-                          <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden flex-1 min-w-[40px]">
-                            <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(c.population / maxChild) * 100}%` }} />
-                          </div>
-                        </div>
-                      </td>
-                      <td className="pl-4 pr-5 py-3 text-right text-gray-600 tabular-nums">{c.households.toLocaleString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+      {/* Area breakdown — the children of the selected level */}
+      {scoped && area.children.length > 0 && (
+        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100">
+            <h2 className="text-base font-semibold text-gray-800">{area.childLabel} of {area.name}</h2>
+            <p className="text-sm text-gray-400">Population and households within this area</p>
           </div>
-        )
-      ) : (
-        /* National demographic trend — only meaningful at country level */
-        <>
-          <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-100">
+                  <th className="px-5 py-3 font-medium">{area.childLabel.replace(/s$/, "")}</th>
+                  <th className="px-4 py-3 font-medium w-1/2">Population</th>
+                  <th className="pl-4 pr-5 py-3 font-medium text-right">Households</th>
+                </tr>
+              </thead>
+              <tbody>
+                {area.children.map((c) => (
+                  <tr key={c.name} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                    <td className="px-5 py-3 text-gray-800">{c.name}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <span className="tabular-nums text-gray-700 w-10 flex-shrink-0">{c.population.toLocaleString()}</span>
+                        <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden flex-1 min-w-[40px]">
+                          <div className="h-full rounded-full bg-[#3752AE]" style={{ width: `${(c.population / maxChild) * 100}%` }} />
+                        </div>
+                      </div>
+                    </td>
+                    <td className="pl-4 pr-5 py-3 text-right text-gray-600 tabular-nums">{c.households.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Demographic trend — national, or the selected area's share when scoped */}
+      <>
+          <div className="grid grid-cols-2 xl:grid-cols-3 gap-4">
             <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${s.growthPct}%`} sub={`${growthUp ? "+" : ""}${s.growthAbs.toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
             <Kpi icon={Baby} label="Births (12 mo)" value={s.births.toLocaleString()} sub={`natural increase +${s.naturalIncrease}`} tone="#10B981" />
             <Kpi icon={Baby} label="Deaths (12 mo)" value={s.deaths.toLocaleString()} sub="registered deaths" tone="#64748B" />
+            <Kpi icon={Heart} label="Marriages (12 mo)" value={s.marriages.toLocaleString()} sub={`${s.married.toLocaleString()} married residents`} tone="#EC4899" />
+            <Kpi icon={HeartCrack} label="Divorces (12 mo)" value={s.divorces.toLocaleString()} sub={`${s.divorced.toLocaleString()} divorced residents`} tone="#F59E0B" />
             <Kpi icon={ArrowLeftRight} label="Net migration" value={`${s.netMigration >= 0 ? "+" : ""}${s.netMigration}`} sub={`${s.movedIn} in · ${s.movedOut} out`} tone="#3752AE" />
           </div>
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
             <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
               <h2 className="text-base font-semibold text-gray-800">Population growth</h2>
-              <p className="text-sm text-gray-400 mb-3">Registered population, last 12 months</p>
+              <p className="text-sm text-gray-400 mb-3">{scoped ? `${area.name} · estimated from area share` : "Registered population, last 12 months"}</p>
               <div className="h-56">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={changeSeries} margin={{ top: 4, right: 12, bottom: 0, left: 4 }}>
@@ -369,20 +428,46 @@ export function PopulationPage() {
               </div>
               <div className="h-56">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
+                  <ComposedChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
                     <CartesianGrid vertical={false} stroke="#F1F5F9" />
                     <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
+                    <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} domain={["auto", "auto"]} />
                     <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                    <ReferenceLine y={0} stroke="#E2E8F0" />
                     <Bar dataKey="births" name="Births" fill={BIRTH_COLOR} radius={[3, 3, 0, 0]} />
                     <Bar dataKey="deaths" name="Deaths" fill={DEATH_COLOR} radius={[3, 3, 0, 0]} />
-                  </BarChart>
+                    <Line type="monotone" dataKey="net" name="Net migration" stroke={OUT_COLOR} strokeWidth={2.5} dot={{ r: 2.5, fill: OUT_COLOR, strokeWidth: 0 }} />
+                  </ComposedChart>
                 </ResponsiveContainer>
               </div>
             </div>
           </div>
-        </>
-      )}
+
+          <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
+            <div className="flex items-start justify-between gap-4 mb-3">
+              <div>
+                <h2 className="text-base font-semibold text-gray-800">Marriages &amp; divorces</h2>
+                <p className="text-sm text-gray-400">Registered civil events per month, last 12 months</p>
+              </div>
+              <div className="flex items-center gap-3 text-xs flex-shrink-0">
+                <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full bg-[#EC4899]" /> Marriages</span>
+                <span className="flex items-center gap-1.5 text-gray-500"><span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: OUT_COLOR }} /> Divorces</span>
+              </div>
+            </div>
+            <div className="h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={changeSeries} margin={{ top: 4, right: 8, bottom: 0, left: -8 }} barGap={2}>
+                  <CartesianGrid vertical={false} stroke="#F1F5F9" />
+                  <XAxis dataKey="month" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+                  <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
+                  <Tooltip cursor={{ fill: "#F8FAFC" }} contentStyle={tooltipStyle} />
+                  <Bar dataKey="marriages" name="Marriages" fill="#EC4899" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="divorces" name="Divorces" fill={OUT_COLOR} radius={[3, 3, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+      </>
 
       {/* Tabs + filters */}
       <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-sm space-y-3">
@@ -460,6 +545,7 @@ export function PopulationPage() {
                   <th className="px-4 py-3 font-medium">Age</th>
                   <th className="px-4 py-3 font-medium">Household</th>
                   <th className="px-4 py-3 font-medium">Address</th>
+                  <th className="px-4 py-3 font-medium">Marital</th>
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="pl-4 pr-5 py-3 font-medium w-px whitespace-nowrap">Action</th>
                 </tr>
@@ -479,6 +565,12 @@ export function PopulationPage() {
                     <td className="px-4 py-3 text-gray-600">
                       {c.village}
                       <span className="block text-[11px] text-gray-400">{c.district}, {c.province}</span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="inline-flex items-center gap-1.5 text-gray-600 whitespace-nowrap">
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: MARITAL_META[c.maritalStatus].color }} />
+                        {MARITAL_META[c.maritalStatus].label}
+                      </span>
                     </td>
                     <td className="px-4 py-3"><StatusChip status={c.status} /></td>
                     <td className="pl-4 pr-5 py-3 w-px whitespace-nowrap">
@@ -501,7 +593,7 @@ export function PopulationPage() {
                 ))}
                 {totalRows === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-5 py-12 text-center text-sm text-gray-400">No citizens match your filters.</td>
+                    <td colSpan={10} className="px-5 py-12 text-center text-sm text-gray-400">No citizens match your filters.</td>
                   </tr>
                 )}
               </tbody>
@@ -618,6 +710,7 @@ export function PopulationPage() {
                       <th className="px-4 py-2.5 font-medium">Gender</th>
                       <th className="px-4 py-2.5 font-medium">Date of birth</th>
                       <th className="px-4 py-2.5 font-medium">Age</th>
+                      <th className="px-4 py-2.5 font-medium">Marital</th>
                       <th className="px-4 py-2.5 font-medium">Status</th>
                       <th className="pl-2 pr-4 py-2.5 font-medium w-px" />
                     </tr>
@@ -633,6 +726,12 @@ export function PopulationPage() {
                         <td className="px-4 py-2.5"><GenderDot gender={m.gender} /></td>
                         <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">{m.dob}</td>
                         <td className="px-4 py-2.5 text-gray-600">{m.age}</td>
+                        <td className="px-4 py-2.5">
+                          <span className="inline-flex items-center gap-1.5 text-gray-600 whitespace-nowrap">
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: MARITAL_META[m.maritalStatus].color }} />
+                            {MARITAL_META[m.maritalStatus].label}
+                          </span>
+                        </td>
                         <td className="px-4 py-2.5"><StatusChip status={m.status} /></td>
                         <td className="pl-2 pr-4 py-2.5 w-px">
                           <button

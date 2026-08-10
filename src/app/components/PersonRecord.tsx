@@ -4,7 +4,7 @@ import {
   WATCH_BY_UIN, WATCH_CATEGORY_META, WATCH_STATUS_META, RISK_META, DOC_STATUS_META,
   documentsFor, eventsFor,
 } from "../data/watchlist";
-import { HOUSEHOLD_BY_NO, type Citizen } from "../data/population";
+import { HOUSEHOLD_BY_NO, MARITAL_META, type Citizen } from "../data/population";
 import photo3x4 from "../../imports/photo3x4.png";
 
 /*
@@ -116,6 +116,7 @@ export function PersonRecord({
           <div className="mt-4">
             <Row label="Date of birth" value={person.dob} />
             <Row label="Relation in household" value={person.relation} />
+            <Row label="Marital status" value={MARITAL_META[person.maritalStatus].label} />
             <Row
               label="Registry status"
               value={person.status === "active" ? "Active" : person.status === "deceased" ? "Deceased" : "Moved out"}
