@@ -278,6 +278,16 @@ export function PopulationPage() {
         <Kpi icon={Globe} label="Foreign residents" value={area.foreign.toLocaleString()} sub={area.population ? `${((area.foreign / area.population) * 100).toFixed(1)}% of population` : "—"} tone="#F59E0B" />
       </div>
 
+      {/* Demographic trend KPIs — national, or the selected area's share when scoped */}
+      <div className="grid grid-cols-2 xl:grid-cols-3 gap-4">
+        <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${s.growthPct}%`} sub={`${growthUp ? "+" : ""}${s.growthAbs.toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
+        <Kpi icon={Baby} label="Births (12 mo)" value={s.births.toLocaleString()} sub={`natural increase +${s.naturalIncrease}`} tone="#10B981" />
+        <Kpi icon={Baby} label="Deaths (12 mo)" value={s.deaths.toLocaleString()} sub="registered deaths" tone="#64748B" />
+        <Kpi icon={Heart} label="Marriages (12 mo)" value={s.marriages.toLocaleString()} sub={`${s.married.toLocaleString()} married residents`} tone="#EC4899" />
+        <Kpi icon={HeartCrack} label="Divorces (12 mo)" value={s.divorces.toLocaleString()} sub={`${s.divorced.toLocaleString()} divorced residents`} tone="#F59E0B" />
+        <Kpi icon={ArrowLeftRight} label="Net migration" value={`${s.netMigration >= 0 ? "+" : ""}${s.netMigration}`} sub={`${s.movedIn} in · ${s.movedOut} out`} tone="#3752AE" />
+      </div>
+
       {/* Age & gender + composition (scoped) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <div className="xl:col-span-2 bg-white rounded-2xl border border-gray-100 p-5 shadow-sm flex flex-col">
@@ -388,16 +398,8 @@ export function PopulationPage() {
         </div>
       )}
 
-      {/* Demographic trend — national, or the selected area's share when scoped */}
+      {/* Demographic trend charts — national, or the selected area's share when scoped */}
       <>
-          <div className="grid grid-cols-2 xl:grid-cols-3 gap-4">
-            <Kpi icon={growthUp ? TrendingUp : TrendingDown} label="Population growth (12 mo)" value={`${growthUp ? "+" : ""}${s.growthPct}%`} sub={`${growthUp ? "+" : ""}${s.growthAbs.toLocaleString()} people`} tone={growthUp ? "#047857" : "#B91C1C"} />
-            <Kpi icon={Baby} label="Births (12 mo)" value={s.births.toLocaleString()} sub={`natural increase +${s.naturalIncrease}`} tone="#10B981" />
-            <Kpi icon={Baby} label="Deaths (12 mo)" value={s.deaths.toLocaleString()} sub="registered deaths" tone="#64748B" />
-            <Kpi icon={Heart} label="Marriages (12 mo)" value={s.marriages.toLocaleString()} sub={`${s.married.toLocaleString()} married residents`} tone="#EC4899" />
-            <Kpi icon={HeartCrack} label="Divorces (12 mo)" value={s.divorces.toLocaleString()} sub={`${s.divorced.toLocaleString()} divorced residents`} tone="#F59E0B" />
-            <Kpi icon={ArrowLeftRight} label="Net migration" value={`${s.netMigration >= 0 ? "+" : ""}${s.netMigration}`} sub={`${s.movedIn} in · ${s.movedOut} out`} tone="#3752AE" />
-          </div>
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
             <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm">
               <h2 className="text-base font-semibold text-gray-800">Population growth</h2>
