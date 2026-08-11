@@ -2,6 +2,7 @@ import { FileText, CalendarClock, Users, BadgeCheck, ShieldAlert, TriangleAlert,
 import { registry, verification } from "../api/endpoints";
 import { useMutation, useQuery } from "../api/hooks";
 import { text, type HouseholdMember, type PersonProfile, type WatchlistEntry } from "../api/types";
+import { maritalLabel } from "../data/marital";
 import photo3x4 from "../../imports/photo3x4.png";
 
 /*
@@ -237,6 +238,7 @@ export function PersonRecord({
           <div className="mt-4">
             <Row label="Date of birth" value={person.date_of_birth ?? "—"} />
             <Row label="Relation in household" value={person.relation || "—"} />
+            <Row label="Marital status" value={maritalLabel(person.marital_status)} />
             <Row label="Registry status" value={REGISTRY_STATUS[person.status] ?? person.status} />
             <Row label="Address" value={address} />
           </div>

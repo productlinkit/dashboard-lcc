@@ -379,6 +379,7 @@ export interface PersonRow {
   age: number;
   nationality: string;
   relation: string;
+  marital_status?: string;
   household_no: string;
   status: string;
   jurisdiction?: Jurisdiction;
@@ -432,10 +433,18 @@ export interface PopulationSummary {
   dependency_ratio: number;
   foreign: number;
   local: number;
+  /* Marital standing of the register as it stands today. */
+  single: number;
+  married: number;
+  divorced: number;
+  widowed: number;
   births: number;
   deaths: number;
   moved_in: number;
   moved_out: number;
+  /* Civil events over the window — reported, but not part of growth. */
+  marriages: number;
+  divorces: number;
   natural_increase: number;
   net_migration: number;
   growth_abs: number;
@@ -454,6 +463,8 @@ export interface DemographicMonth {
   deaths: number;
   moved_in: number;
   moved_out: number;
+  marriages: number;
+  divorces: number;
   population: number;
 }
 
@@ -487,6 +498,10 @@ export interface AreaSummary {
   minors: number;
   seniors: number;
   foreign: number;
+  single: number;
+  married: number;
+  divorced: number;
+  widowed: number;
   age_bands: AgeBand[];
   child_label: string;
   children: AreaChild[];
@@ -518,6 +533,8 @@ export interface HouseholdMember {
   age?: number;
   relation: string;
   nationality: string;
+  /* Read through from the person register — blank when no person is linked. */
+  marital_status?: string;
   status: string;
   photo_url?: string;
 }
